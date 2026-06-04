@@ -1,0 +1,6 @@
+﻿spring:
+  application:
+    name: banquito-switch-routing-service
+
+server:
+  port: 8080

@@ -1,0 +1,35 @@
+﻿# Git
+.git
+.gitignore
+.gitattributes
+
+# IDE
+.idea
+.vscode
+*.iml
+
+# Build output
+target
+
+# Environment (secrets)
+.env
+.env.*
+
+# Documentation
+docs
+Requisitos
+README.md
+AGENTS.md
+DB
+
+# Docker (avoid recursive copy)
+docker
+
+# SFTP inbox data
+sftp-inbox
+
+# Postman collections
+postman
+
+# GitHub workflows
+.github
