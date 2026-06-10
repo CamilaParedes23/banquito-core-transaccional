@@ -1,19 +1,10 @@
-# Maven / Java
 target/
-*.class
-
-# IntelliJ IDEA
+!.mvn/wrapper/maven-wrapper.jar
+.env
+.env.*
+!.env.example
+*.log
 .idea/
 *.iml
-
-# Variables / logs
-.env
-*.log
-
-# Carpetas locales no versionadas
-/postman/
-/sql/
-
-# Sistema operativo
+.vscode/
 .DS_Store
-Thumbs.db

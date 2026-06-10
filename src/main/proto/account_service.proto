@@ -1,0 +1,17 @@
+syntax = "proto3";
+package banquito.core.account;
+option java_multiple_files = true;
+option java_package = "com.banquito.core.account.grpc";
+
+service AccountQueryService {
+  rpc ValidateAccount(ValidateAccountRequest) returns (ValidateAccountResponse);
+  rpc GetAccountBalance(GetAccountBalanceRequest) returns (GetAccountBalanceResponse);
+  rpc GetAccountsByCustomer(GetAccountsByCustomerRequest) returns (GetAccountsByCustomerResponse);
+}
+message ValidateAccountRequest { string accountNumber = 1; string requiredStatus = 2; }
+message ValidateAccountResponse { bool valid = 1; string accountUuid = 2; string customerUuid = 3; string status = 4; }
+message GetAccountBalanceRequest { string accountNumber = 1; }
+message GetAccountBalanceResponse { string accountNumber = 1; string status = 2; string accountingBalance = 3; string availableBalance = 4; string withheldAmount = 5; }
+message GetAccountsByCustomerRequest { string customerUuid = 1; string status = 2; bool onlyTransferable = 3; string purpose = 4; bool includeBalance = 5; }
+message AccountSummary { string accountUuid = 1; string accountNumber = 2; string status = 3; string subtypeCode = 4; string availableBalance = 5; }
+message GetAccountsByCustomerResponse { repeated AccountSummary accounts = 1; }

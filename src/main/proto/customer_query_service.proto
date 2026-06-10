@@ -1,0 +1,65 @@
+syntax = "proto3";
+
+package banquito.core.customer.v1;
+
+option java_package = "com.banquito.core.customer.infrastructure.grpc";
+option java_multiple_files = true;
+
+service CustomerQueryService {
+  rpc GetCustomerByUuid(GetCustomerByUuidRequest) returns (CustomerBasicGrpcResponse);
+  rpc GetCustomerByIdentification(GetCustomerByIdentificationRequest) returns (CustomerBasicGrpcResponse);
+  rpc ValidateCustomerStatus(ValidateCustomerStatusRequest) returns (ValidationGrpcResponse);
+  rpc ValidateMassPaymentsEnabled(ValidateMassPaymentsEnabledRequest) returns (ValidationGrpcResponse);
+  rpc GetCustomerRelationships(GetCustomerRelationshipsRequest) returns (GetCustomerRelationshipsResponse);
+}
+
+message GetCustomerByUuidRequest {
+  string customer_uuid = 1;
+}
+
+message GetCustomerByIdentificationRequest {
+  string identification = 1;
+}
+
+message ValidateCustomerStatusRequest {
+  string customer_uuid = 1;
+}
+
+message ValidateMassPaymentsEnabledRequest {
+  string customer_uuid = 1;
+}
+
+message CustomerBasicGrpcResponse {
+  string customer_uuid = 1;
+  string customer_type = 2;
+  string identification_type = 3;
+  string identification = 4;
+  string display_name = 5;
+  string status = 6;
+  bool mass_payments_enabled = 7;
+}
+
+message ValidationGrpcResponse {
+  bool valid = 1;
+  string code = 2;
+  string message = 3;
+}
+
+message GetCustomerRelationshipsRequest {
+  string customer_uuid = 1;
+  string relationship_type = 2;
+}
+
+message CustomerRelationshipGrpcResponse {
+  string relationship_uuid = 1;
+  string origin_customer_uuid = 2;
+  string related_customer_uuid = 3;
+  string relationship_type = 4;
+  string related_identification = 5;
+  string related_name = 6;
+  string status = 7;
+}
+
+message GetCustomerRelationshipsResponse {
+  repeated CustomerRelationshipGrpcResponse relationships = 1;
+}

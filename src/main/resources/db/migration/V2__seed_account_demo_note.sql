@@ -1,0 +1,1 @@
+-- Datos demo amplios se crearán en una migración posterior cuando se definan los escenarios de prueba integrales.

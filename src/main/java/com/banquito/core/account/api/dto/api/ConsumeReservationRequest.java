@@ -1,0 +1,3 @@
+package com.banquito.core.account.api.dto.api;
+
+public record ConsumeReservationRequest(@jakarta.validation.constraints.NotBlank String paymentLineUuid, @jakarta.validation.constraints.NotBlank String destinationType, @jakarta.validation.constraints.NotBlank String routingCode, String destinationAccountNumber, String externalDestinationAccount, @jakarta.validation.constraints.NotBlank String beneficiaryIdentification, @jakarta.validation.constraints.NotBlank String beneficiaryName, String beneficiaryEmail, String concept, @jakarta.validation.constraints.NotNull java.math.BigDecimal amount, String accountingDate, String correlationId) {}

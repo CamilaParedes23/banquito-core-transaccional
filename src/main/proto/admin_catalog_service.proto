@@ -1,0 +1,89 @@
+syntax = "proto3";
+
+package banquito.core.admin.v1;
+
+option java_multiple_files = true;
+option java_package = "com.banquito.core.admin.infrastructure.grpc.generated";
+option java_outer_classname = "AdminCatalogProto";
+
+service AdminCatalogService {
+  rpc GetBranchByCode(BranchCodeRequest) returns (BranchResponse);
+  rpc GetParameterByCode(ParameterCodeRequest) returns (ParameterResponse);
+  rpc GetIvaRate(EmptyRequest) returns (DecimalValueResponse);
+  rpc GetOperationalWindowByCode(OperationalWindowCodeRequest) returns (OperationalWindowResponse);
+  rpc GetOperationalWindowByDomain(OperationalWindowDomainRequest) returns (OperationalWindowListResponse);
+  rpc GetInstitutionByRoutingCode(RoutingCodeRequest) returns (FinancialInstitutionResponse);
+  rpc GetAccountSubtype(AccountSubtypeCodeRequest) returns (AccountSubtypeResponse);
+  rpc GetTransactionSubtype(TransactionSubtypeCodeRequest) returns (TransactionSubtypeResponse);
+  rpc IsBusinessDay(BusinessDayRequest) returns (BusinessDayResponse);
+}
+
+message EmptyRequest {}
+message BranchCodeRequest { string code = 1; }
+message ParameterCodeRequest { string code = 1; }
+message OperationalWindowCodeRequest { string code = 1; }
+message OperationalWindowDomainRequest { string domain = 1; }
+message RoutingCodeRequest { string routing_code = 1; }
+message AccountSubtypeCodeRequest { string code = 1; }
+message TransactionSubtypeCodeRequest { string code = 1; }
+message BusinessDayRequest { string date = 1; }
+
+message BranchResponse {
+  string branch_uuid = 1;
+  string code = 2;
+  string name = 3;
+  string city = 4;
+  string status = 5;
+}
+
+message ParameterResponse {
+  string code = 1;
+  string name = 2;
+  string value = 3;
+  string data_type = 4;
+  string status = 5;
+}
+
+message DecimalValueResponse { string value = 1; }
+
+message OperationalWindowResponse {
+  string code = 1;
+  string name = 2;
+  string operational_domain = 3;
+  string start_time = 4;
+  string cutoff_time = 5;
+  string end_time = 6;
+  string action_after_cutoff = 7;
+  string status = 8;
+}
+
+message OperationalWindowListResponse { repeated OperationalWindowResponse windows = 1; }
+
+message FinancialInstitutionResponse {
+  string routing_code = 1;
+  string name = 2;
+  bool banquito = 3;
+  string status = 4;
+}
+
+message AccountSubtypeResponse {
+  string code = 1;
+  string base_type = 2;
+  string name = 3;
+  string status = 4;
+}
+
+message TransactionSubtypeResponse {
+  string code = 1;
+  string name = 2;
+  string base_movement_type = 3;
+  string status = 4;
+}
+
+message BusinessDayResponse {
+  string date = 1;
+  bool holiday = 2;
+  bool weekend = 3;
+  bool business_day = 4;
+  string description = 5;
+}
