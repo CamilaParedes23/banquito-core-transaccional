@@ -1,10 +1,35 @@
+# Maven / Java
 target/
-!.mvn/wrapper/maven-wrapper.jar
+*.class
+*.jar
+*.war
+*.ear
+
+# IDE
+.idea/
+.vscode/
+*.iml
+.project
+.classpath
+.settings/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs / runtime
+logs/
+*.log
+
+# Env / secrets
 .env
 .env.*
 !.env.example
-*.log
-.idea/
-*.iml
-.vscode/
-.DS_Store
+
+# Docker local
+.docker/
+
+# Carpetas locales no versionadas
+/postman/
+/sql/
+/docs/
