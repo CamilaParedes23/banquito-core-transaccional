@@ -1,3 +1,19 @@
 package com.banquito.core.account.api.dto.api;
 
-public record ReservationRequest(@jakarta.validation.constraints.NotBlank String batchId, @jakarta.validation.constraints.NotBlank String correlationId, @jakarta.validation.constraints.NotBlank String companyCustomerUuid, @jakarta.validation.constraints.NotBlank String mainAccountNumber, @jakarta.validation.constraints.NotNull java.math.BigDecimal totalAmount, java.math.BigDecimal commissionAmount, String channel, String accountingDate) {}
+import jakarta.validation.constraints.DecimalMin;
+import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.NotNull;
+import jakarta.validation.constraints.Size;
+
+import java.math.BigDecimal;
+
+public record ReservationRequest(
+        @NotBlank @Size(max = 80) String batchId,
+        @NotBlank @Size(max = 36) String correlationId,
+        @NotBlank @Size(max = 36) String companyCustomerUuid,
+        @NotBlank @Size(max = 24) String mainAccountNumber,
+        @NotNull @DecimalMin(value = "0.01") BigDecimal totalAmount,
+        @DecimalMin(value = "0.00") BigDecimal commissionAmount,
+        @Size(max = 30) String channel,
+        String accountingDate
+) {}

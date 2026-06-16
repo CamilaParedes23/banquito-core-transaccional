@@ -7,8 +7,11 @@ import com.banquito.core.account.domain.repository.*;
 import com.banquito.core.account.infrastructure.grpc.client.AdminGrpcClient;
 import com.banquito.core.account.infrastructure.grpc.client.AccountingGrpcClient;
 import com.banquito.core.account.infrastructure.grpc.client.CustomerGrpcClient;
+import com.banquito.core.admin.infrastructure.grpc.generated.AccountSubtypeResponse;
+import com.banquito.core.customer.infrastructure.grpc.CustomerBasicGrpcResponse;
 import com.banquito.core.account.shared.exception.BusinessException;
 import com.banquito.core.account.shared.tracing.CorrelationIdHolder;
+import tools.jackson.databind.ObjectMapper;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Pageable;
@@ -45,6 +48,7 @@ public class AccountService {
     private final AdminGrpcClient adminGrpcClient;
     private final AccountingGrpcClient accountingGrpcClient;
     private final TransactionTemplate transactionTemplate;
+    private final ObjectMapper objectMapper;
 
     public AccountService(CuentaRepository cuentaRepository,
                           TransaccionCuentaRepository transaccionRepository,
@@ -58,7 +62,8 @@ public class AccountService {
                           CustomerGrpcClient customerGrpcClient,
                           AdminGrpcClient adminGrpcClient,
                           AccountingGrpcClient accountingGrpcClient,
-                          PlatformTransactionManager transactionManager) {
+                          PlatformTransactionManager transactionManager,
+                          ObjectMapper objectMapper) {
         this.cuentaRepository = cuentaRepository;
         this.transaccionRepository = transaccionRepository;
         this.bloqueoRepository = bloqueoRepository;
@@ -72,18 +77,23 @@ public class AccountService {
         this.adminGrpcClient = adminGrpcClient;
         this.accountingGrpcClient = accountingGrpcClient;
         this.transactionTemplate = new TransactionTemplate(transactionManager);
+        this.objectMapper = objectMapper;
     }
 
     @Transactional(readOnly = true)
     public List<AccountResponse> listByCustomer(String customerUuid, String status, Boolean onlyTransferable, String purpose, Boolean includeBalance) {
-        customerGrpcClient.validateActive(customerUuid);
+        String normalizedCustomerUuid = normalizeRequired(customerUuid, "CUSTOMER_UUID_REQUIRED", "El UUID del cliente es obligatorio");
+        // Consulta de lectura: Account es la fuente de cuentas y ya mantiene el UUID del cliente.
+        // No se bloquea el listado con una validación remota a Customer, para mantener simetría
+        // con /by-customer-identification y evitar acoplamiento fuerte en consultas.
+
         List<Cuenta> accounts;
         if (purpose != null && !purpose.isBlank()) {
-            accounts = cuentaRepository.findByUuidClienteAndPropositoCuentaOrderByFechaAperturaDesc(customerUuid, parseEnum(purpose, PropositoCuentaEnum.class, "ACCOUNT_INVALID_PURPOSE", "Propósito de cuenta inválido"));
+            accounts = cuentaRepository.findByUuidClienteAndPropositoCuentaOrderByFechaAperturaDesc(normalizedCustomerUuid, parseEnum(purpose, PropositoCuentaEnum.class, "ACCOUNT_INVALID_PURPOSE", "Propósito de cuenta inválido"));
         } else if (status != null && !status.isBlank()) {
-            accounts = cuentaRepository.findByUuidClienteAndEstadoOrderByFechaAperturaDesc(customerUuid, parseEnum(status, EstadoCuentaEnum.class, "ACCOUNT_INVALID_STATUS", "Estado de cuenta inválido"));
+            accounts = cuentaRepository.findByUuidClienteAndEstadoOrderByFechaAperturaDesc(normalizedCustomerUuid, parseEnum(status, EstadoCuentaEnum.class, "ACCOUNT_INVALID_STATUS", "Estado de cuenta inválido"));
         } else {
-            accounts = cuentaRepository.findByUuidClienteOrderByFechaAperturaDesc(customerUuid);
+            accounts = cuentaRepository.findByUuidClienteOrderByFechaAperturaDesc(normalizedCustomerUuid);
         }
         return accounts.stream()
                 .filter(c -> !Boolean.TRUE.equals(onlyTransferable) || c.getEstado() == EstadoCuentaEnum.ACTIVA)
@@ -146,19 +156,48 @@ public class AccountService {
                 .toList();
     }
 
+    @Transactional(readOnly = true)
+    public AccountTransactionResponse getTransaction(String transactionUuid) {
+        TransaccionCuenta transaction = transaccionRepository.findByUuidTransaccion(transactionUuid)
+                .orElseThrow(() -> notFound("ACCOUNT_TRANSACTION_NOT_FOUND", "Transacción no encontrada"));
+        return AccountMapper.toTransaction(transaction);
+    }
+
     @Transactional
     public AccountResponse createAccount(CreateAccountRequest r) {
-        customerGrpcClient.validateActive(r.customerUuid());
+        CustomerBasicGrpcResponse customer = customerGrpcClient.getByUuid(r.customerUuid());
+        if (!"ACTIVO".equalsIgnoreCase(customer.getStatus())) {
+            throw new BusinessException("CUSTOMER_NOT_ACTIVE", "El cliente no está activo", HttpStatus.CONFLICT);
+        }
+        if (!customer.getIdentification().equals(r.identification())) {
+            throw new BusinessException("ACCOUNT_CUSTOMER_IDENTIFICATION_MISMATCH",
+                    "La identificación no corresponde al cliente indicado", HttpStatus.CONFLICT);
+        }
+
         adminGrpcClient.validateBranchActive(r.branchCode());
-        adminGrpcClient.validateAccountSubtypeActive(r.subtypeCode());
+        AccountSubtypeResponse product = adminGrpcClient.getActiveAccountSubtype(r.subtypeCode());
+        PropositoCuentaEnum purpose = parseEnum(
+                defaultString(r.accountPurpose(), PropositoCuentaEnum.GENERAL.name()),
+                PropositoCuentaEnum.class,
+                "ACCOUNT_INVALID_PURPOSE",
+                "Propósito de cuenta inválido");
+        validateAccountProductEligibility(product, customer, purpose, r);
 
         BigDecimal initial = money(r.initialBalance() == null ? ZERO : r.initialBalance());
+        BigDecimal minimumOpeningBalance = product.getMinimumOpeningBalance().isBlank()
+                ? ZERO
+                : new BigDecimal(product.getMinimumOpeningBalance()).setScale(2, RoundingMode.HALF_UP);
+        if (initial.compareTo(minimumOpeningBalance) < 0) {
+            throw new BusinessException("ACCOUNT_MINIMUM_OPENING_BALANCE_NOT_MET",
+                    "El saldo inicial es menor al mínimo requerido para el producto", HttpStatus.CONFLICT);
+        }
+
         Cuenta c = new Cuenta();
         c.setUuidCuenta(UUID.randomUUID().toString());
         c.setNumeroCuenta(generateAccountNumber(r.branchCode()));
-        c.setUuidCliente(r.customerUuid());
-        c.setIdentificacionTitular(r.identification());
-        c.setNombreTitularReferencia(r.holderName());
+        c.setUuidCliente(customer.getCustomerUuid());
+        c.setIdentificacionTitular(customer.getIdentification());
+        c.setNombreTitularReferencia(customer.getDisplayName());
         c.setCodigoSucursal(r.branchCode());
         c.setCodigoSubtipoCuenta(r.subtypeCode());
         c.setEstado(EstadoCuentaEnum.ACTIVA);
@@ -170,11 +209,11 @@ public class AccountService {
         c.setEsCuentaMatrizPagos(Boolean.TRUE.equals(r.massPaymentMainAccount()));
         c.setEsCuentaFavoritaPagos(Boolean.TRUE.equals(r.favoritePaymentAccount()));
         c.setAliasOperativo(r.operationalAlias());
-        c.setPropositoCuenta(r.accountPurpose() == null ? PropositoCuentaEnum.GENERAL : PropositoCuentaEnum.valueOf(r.accountPurpose()));
+        c.setPropositoCuenta(purpose);
         c.setFechaApertura(LocalDateTime.now());
         c.setFechaActualizacion(LocalDateTime.now());
         if (Boolean.TRUE.equals(c.getEsCuentaFavoritaPagos())) clearFavorite(c.getUuidCliente());
-        Cuenta saved = cuentaRepository.save(c);
+        Cuenta saved = cuentaRepository.saveAndFlush(c);
         auditoriaService.registrar("CREATE_ACCOUNT", "CUENTA", saved.getUuidCuenta(), ResultadoAuditoriaAccountEnum.OK, null);
         outboxEventService.registrar("ACCOUNT_CREATED", "CUENTA", saved.getUuidCuenta(), "{\"accountNumber\":\"" + saved.getNumeroCuenta() + "\"}");
         return AccountMapper.toResponse(saved);
@@ -218,9 +257,13 @@ public class AccountService {
         String subtype = defaultString(r.subtypeCode(), "DEP_VENTANILLA");
         adminGrpcClient.validateTransactionSubtypeActive(subtype, TipoMovimientoCuentaEnum.CREDITO.name());
         LocalDate date = parseDate(r.accountingDate());
-        TransaccionCuenta tx = applyMovement(findAccount(r.accountNumber()), TipoMovimientoCuentaEnum.CREDITO, money(r.amount()), subtype,
-                CanalOrigenCuentaEnum.valueOf(defaultString(r.channel(), "VENTANILLA")), r.externalReference(), date, r.correlationId(), null, null);
-        registerCashJournal(tx, true);
+        Cuenta account = findAccount(r.accountNumber());
+        CustomerBasicGrpcResponse customer = customerGrpcClient.getByUuid(account.getUuidCliente());
+        TransaccionCuenta tx = applyMovement(account, TipoMovimientoCuentaEnum.CREDITO, money(r.amount()), subtype,
+                tellerChannel(r.channel()), r.externalReference(), date, r.correlationId(), null, null);
+        tx.setAsientoContableUuid(registerCashJournal(tx, true));
+        transaccionRepository.saveAndFlush(tx);
+        registerTellerCompletedEvent(tx, "TELLER_DEPOSIT_COMPLETED", "DEPOSITO", customer.getEmail());
         return AccountMapper.toTransaction(tx);
     }
 
@@ -229,28 +272,88 @@ public class AccountService {
         String subtype = defaultString(r.subtypeCode(), "RET_VENTANILLA");
         adminGrpcClient.validateTransactionSubtypeActive(subtype, TipoMovimientoCuentaEnum.DEBITO.name());
         LocalDate date = parseDate(r.accountingDate());
-        TransaccionCuenta tx = applyMovement(findAccount(r.accountNumber()), TipoMovimientoCuentaEnum.DEBITO, money(r.amount()), subtype,
-                CanalOrigenCuentaEnum.valueOf(defaultString(r.channel(), "VENTANILLA")), r.externalReference(), date, r.correlationId(), null, null);
-        registerCashJournal(tx, false);
+        Cuenta account = findAccount(r.accountNumber());
+        CustomerBasicGrpcResponse customer = customerGrpcClient.getByUuid(account.getUuidCliente());
+        TransaccionCuenta tx = applyMovement(account, TipoMovimientoCuentaEnum.DEBITO, money(r.amount()), subtype,
+                tellerChannel(r.channel()), r.externalReference(), date, r.correlationId(), null, null);
+        tx.setAsientoContableUuid(registerCashJournal(tx, false));
+        transaccionRepository.saveAndFlush(tx);
+        registerTellerCompletedEvent(tx, "TELLER_WITHDRAWAL_COMPLETED", "RETIRO", customer.getEmail());
         return AccountMapper.toTransaction(tx);
+    }
+
+    @Transactional(readOnly = true)
+    public P2PBeneficiaryValidationResponse validateP2PBeneficiary(String accountNumber) {
+        if (accountNumber == null || accountNumber.isBlank()) {
+            throw new BusinessException(
+                    "ACCOUNT_NUMBER_REQUIRED",
+                    "El número de cuenta destino es obligatorio",
+                    HttpStatus.BAD_REQUEST
+            );
+        }
+        return cuentaRepository.findByNumeroCuenta(accountNumber.trim())
+                .map(account -> new P2PBeneficiaryValidationResponse(
+                        true,
+                        account.getEstado().name(),
+                        account.getNombreTitularReferencia(),
+                        "Banco BanQuito"
+                ))
+                .orElseGet(() -> new P2PBeneficiaryValidationResponse(
+                        false,
+                        "NO_ENCONTRADA",
+                        null,
+                        "Banco BanQuito"
+                ));
     }
 
     @Transactional
     public List<AccountTransactionResponse> p2p(P2PTransferRequest r) {
         LocalDate date = parseDate(r.accountingDate());
-        String corr = r.correlationId() == null ? UUID.randomUUID().toString() : r.correlationId();
+        String corr = r.correlationId() == null || r.correlationId().isBlank()
+                ? UUID.randomUUID().toString()
+                : r.correlationId().trim();
         Cuenta source = findActiveAccount(r.sourceAccountNumber());
         Cuenta target = findActiveAccount(r.targetAccountNumber());
+        CustomerBasicGrpcResponse sourceCustomer = customerGrpcClient.getByUuid(source.getUuidCliente());
+        CustomerBasicGrpcResponse targetCustomer = customerGrpcClient.getByUuid(target.getUuidCliente());
         TransaccionCuenta debit = applyMovement(source, TipoMovimientoCuentaEnum.DEBITO, money(r.amount()), "TRF_P2P_DEB", CanalOrigenCuentaEnum.BANCA_WEB, r.description(), date, corr, null, null);
         TransaccionCuenta credit = applyMovement(target, TipoMovimientoCuentaEnum.CREDITO, money(r.amount()), "TRF_P2P_CRE", CanalOrigenCuentaEnum.BANCA_WEB, r.description(), date, corr, null, null);
-        registerP2PJournal(debit, credit);
+        String asientoContableUuid = registerP2PJournal(debit, credit);
+        debit.setAsientoContableUuid(asientoContableUuid);
+        credit.setAsientoContableUuid(asientoContableUuid);
+        transaccionRepository.saveAllAndFlush(List.of(debit, credit));
+
+        Map<String, Object> eventPayload = new LinkedHashMap<>();
+        eventPayload.put("correlationId", corr);
+        eventPayload.put("sourceCustomerUuid", source.getUuidCliente());
+        eventPayload.put("targetCustomerUuid", target.getUuidCliente());
+        eventPayload.put("sourceAccountNumber", source.getNumeroCuenta());
+        eventPayload.put("targetAccountNumber", target.getNumeroCuenta());
+        eventPayload.put("sourceHolderName", source.getNombreTitularReferencia());
+        eventPayload.put("targetHolderName", target.getNombreTitularReferencia());
+        eventPayload.put("sourceEmail", sourceCustomer.getEmail());
+        eventPayload.put("targetEmail", targetCustomer.getEmail());
+        eventPayload.put("amount", money(r.amount()));
+        eventPayload.put("description", r.description());
+        eventPayload.put("accountingDate", date.toString());
+        eventPayload.put("debitTransactionUuid", debit.getUuidTransaccion());
+        eventPayload.put("creditTransactionUuid", credit.getUuidTransaccion());
+        eventPayload.put("receiptNumber", debit.getNumeroComprobante());
+        outboxEventService.registrar(
+                "P2P_TRANSFER_COMPLETED",
+                "TRANSFERENCIA_P2P",
+                corr,
+                corr,
+                toJson(eventPayload)
+        );
+
         return List.of(AccountMapper.toTransaction(debit), AccountMapper.toTransaction(credit));
     }
 
     @Transactional
     public BlockResponse block(String accountNumber, BlockAccountRequest r) {
         Cuenta c = findActiveAccount(accountNumber);
-        BigDecimal amount = money(r.amount());
+        BigDecimal amount = positiveMoney(r.amount());
         ensureAvailable(c, amount);
         c.setMontoRetenido(c.getMontoRetenido().add(amount));
         c.setSaldoDisponible(c.getSaldoDisponible().subtract(amount));
@@ -282,16 +385,68 @@ public class AccountService {
     }
 
     @Transactional
-    public AccountTransactionResponse reverseTransaction(String txUuid) {
-        TransaccionCuenta original = transaccionRepository.findByUuidTransaccion(txUuid).orElseThrow(() -> notFound("ACCOUNT_TRANSACTION_NOT_FOUND", "Transacción no encontrada"));
-        if (original.getEstado() == EstadoTransaccionCuentaEnum.REVERSADA) throw new BusinessException("ACCOUNT_TRANSACTION_ALREADY_REVERSED", "La transacción ya fue reversada", HttpStatus.CONFLICT);
-        TipoMovimientoCuentaEnum reverseType = original.getTipoMovimiento() == TipoMovimientoCuentaEnum.DEBITO ? TipoMovimientoCuentaEnum.CREDITO : TipoMovimientoCuentaEnum.DEBITO;
-        TransaccionCuenta rev = applyMovement(original.getCuenta(), reverseType, original.getMonto(), "REVERSO", CanalOrigenCuentaEnum.CORE_INTERNO, "Reverso de " + txUuid, original.getFechaContable(), UUID.randomUUID().toString(), null, null);
-        rev.setTransaccionReversada(original);
+    public AccountTransactionResponse reverseTransaction(String txUuid, ReverseTransactionRequest request) {
+        TransaccionCuenta original = transaccionRepository.findByUuidTransaccionForUpdate(txUuid)
+                .orElseThrow(() -> notFound("ACCOUNT_TRANSACTION_NOT_FOUND", "Transacción no encontrada"));
+        if (original.getTransaccionReversada() != null) {
+            throw new BusinessException("ACCOUNT_REVERSAL_CANNOT_BE_REVERSED",
+                    "Una transacción compensatoria no puede ser reversada", HttpStatus.CONFLICT);
+        }
+        if (original.getEstado() == EstadoTransaccionCuentaEnum.REVERSADA
+                || transaccionRepository.existsByTransaccionReversada(original)) {
+            throw new BusinessException("ACCOUNT_TRANSACTION_ALREADY_REVERSED",
+                    "La transacción ya fue reversada", HttpStatus.CONFLICT);
+        }
+        if (original.getEstado() != EstadoTransaccionCuentaEnum.APLICADA) {
+            throw new BusinessException("ACCOUNT_TRANSACTION_NOT_REVERSIBLE",
+                    "La transacción no se encuentra en un estado reversible", HttpStatus.CONFLICT);
+        }
+        if (original.getCanalOrigen() != CanalOrigenCuentaEnum.VENTANILLA) {
+            throw new BusinessException("ACCOUNT_TRANSACTION_REVERSAL_UNSUPPORTED",
+                    "En esta fase solo se permiten reversos de depósitos y retiros de ventanilla", HttpStatus.CONFLICT);
+        }
+
+        TipoMovimientoCuentaEnum reverseType = original.getTipoMovimiento() == TipoMovimientoCuentaEnum.DEBITO
+                ? TipoMovimientoCuentaEnum.CREDITO
+                : TipoMovimientoCuentaEnum.DEBITO;
+        String reverseSubtype = reverseType == TipoMovimientoCuentaEnum.DEBITO
+                ? "REVERSO_DEBITO"
+                : "REVERSO_CREDITO";
+        String correlationId = request.correlationId() == null || request.correlationId().isBlank()
+                ? CorrelationIdHolder.get()
+                : request.correlationId().trim();
+
+        TransaccionCuenta reversal = applyMovement(
+                original.getCuenta(),
+                reverseType,
+                original.getMonto(),
+                reverseSubtype,
+                CanalOrigenCuentaEnum.CORE_INTERNO,
+                request.reason(),
+                original.getFechaContable(),
+                correlationId,
+                null,
+                null);
+        reversal.setTransaccionReversada(original);
+        reversal.setMotivoReverso(request.reason());
+        reversal.setUuidUsuarioReverso(request.userCoreUuid());
+
+        String journalEntryUuid = registerGenericClientJournal(
+                reversal,
+                reverseSubtype,
+                "Reverso de transacción " + txUuid + ": " + request.reason());
+        reversal.setAsientoContableUuid(journalEntryUuid);
         original.setEstado(EstadoTransaccionCuentaEnum.REVERSADA);
-        transaccionRepository.save(original);
-        registerGenericClientJournal(rev, "REVERSO", "Reverso de transacción " + txUuid);
-        return AccountMapper.toTransaction(rev);
+        transaccionRepository.saveAllAndFlush(List.of(original, reversal));
+
+        auditoriaService.registrar("REVERSE_ACCOUNT_TRANSACTION", "TRANSACCION_CUENTA", txUuid,
+                ResultadoAuditoriaAccountEnum.OK,
+                "{\"reversalTransactionUuid\":\"" + reversal.getUuidTransaccion()
+                        + "\",\"userCoreUuid\":\"" + request.userCoreUuid() + "\"}");
+        outboxEventService.registrar("ACCOUNT_TRANSACTION_REVERSED", "TRANSACCION_CUENTA", txUuid,
+                "{\"originalTransactionUuid\":\"" + txUuid
+                        + "\",\"reversalTransactionUuid\":\"" + reversal.getUuidTransaccion() + "\"}");
+        return AccountMapper.toTransaction(reversal);
     }
 
     @Transactional
@@ -299,7 +454,9 @@ public class AccountService {
         customerGrpcClient.validateMassPaymentsEnabled(r.companyCustomerUuid());
         Cuenta main = findActiveAccount(r.mainAccountNumber());
         if (!Objects.equals(main.getUuidCliente(), r.companyCustomerUuid())) throw new BusinessException("ACCOUNT_RESERVATION_CUSTOMER_MISMATCH", "La cuenta matriz no pertenece a la empresa indicada", HttpStatus.CONFLICT);
-        BigDecimal total = money(r.totalAmount()).add(money(r.commissionAmount() == null ? ZERO : r.commissionAmount()));
+        BigDecimal totalAmount = positiveMoney(r.totalAmount());
+        BigDecimal commissionAmount = money(r.commissionAmount() == null ? ZERO : r.commissionAmount());
+        BigDecimal total = totalAmount.add(commissionAmount);
         ensureAvailable(main, total);
         main.setSaldoDisponible(main.getSaldoDisponible().subtract(total));
         main.setMontoRetenido(main.getMontoRetenido().add(total));
@@ -311,8 +468,8 @@ public class AccountService {
         res.setCuentaMatriz(main);
         res.setNumeroCuentaMatriz(main.getNumeroCuenta());
         res.setCanalOrigen(CanalOrigenReservaEnum.valueOf(defaultString(r.channel(), "SWITCH_API")));
-        res.setMontoTotalLote(money(r.totalAmount()));
-        res.setMontoComision(money(r.commissionAmount() == null ? ZERO : r.commissionAmount()));
+        res.setMontoTotalLote(totalAmount);
+        res.setMontoComision(commissionAmount);
         res.setMontoReservado(total);
         res.setMontoConsumidoOnus(ZERO);
         res.setMontoConsumidoOffus(ZERO);
@@ -366,7 +523,7 @@ public class AccountService {
 
         validarReservaConsumible(res);
 
-        BigDecimal amount = money(r.amount());
+        BigDecimal amount = positiveMoney(r.amount());
         BigDecimal consumed = res.getMontoConsumidoOnus().add(res.getMontoConsumidoOffus()).add(res.getMontoLiberado());
         if (consumed.add(amount).compareTo(res.getMontoReservado()) > 0) {
             throw new BusinessException("ACCOUNT_RESERVATION_INSUFFICIENT", "La reserva no tiene saldo suficiente", HttpStatus.CONFLICT);
@@ -446,6 +603,31 @@ public class AccountService {
         movimiento.setAsientoContableUuid(asientoContableUuid);
         transaccionRepository.saveAndFlush(tx);
         movimientoReservaRepository.saveAndFlush(movimiento);
+
+        InstruccionPagoMasivoCore instruction = tx.getInstruccionPagoCore();
+        if (instruction != null && instruction.getTipoDestino() == TipoDestinoPagoMasivoEnum.ON_US) {
+            Map<String, Object> eventPayload = new LinkedHashMap<>();
+            eventPayload.put("correlationId", tx.getUuidCorrelacion());
+            eventPayload.put("transactionUuid", tx.getUuidTransaccion());
+            eventPayload.put("paymentLineUuid", instruction.getPaymentLineUuid());
+            eventPayload.put("reservationUuid", instruction.getReservaPagoMasivo().getUuidReserva());
+            eventPayload.put("beneficiaryCustomerUuid", tx.getCuenta().getUuidCliente());
+            eventPayload.put("beneficiaryName", instruction.getNombreBeneficiario());
+            eventPayload.put("beneficiaryEmail", instruction.getEmailBeneficiario());
+            eventPayload.put("destinationAccountNumber", tx.getCuenta().getNumeroCuenta());
+            eventPayload.put("companyName", instruction.getReservaPagoMasivo().getCuentaMatriz().getNombreTitularReferencia());
+            eventPayload.put("amount", tx.getMonto());
+            eventPayload.put("concept", instruction.getConcepto());
+            eventPayload.put("accountingDate", tx.getFechaContable().toString());
+            eventPayload.put("receiptNumber", tx.getNumeroComprobante());
+            outboxEventService.registrar(
+                    "ONUS_PAYMENT_COMPLETED",
+                    "INSTRUCCION_PAGO_MASIVO_CORE",
+                    instruction.getPaymentLineUuid(),
+                    tx.getUuidCorrelacion(),
+                    toJson(eventPayload)
+            );
+        }
     }
 
     @Transactional
@@ -492,6 +674,7 @@ public class AccountService {
     }
 
     private TransaccionCuenta applyMovement(Cuenta c, TipoMovimientoCuentaEnum type, BigDecimal amount, String subtype, CanalOrigenCuentaEnum channel, String externalRef, LocalDate date, String correlation, ReservaPagoMasivo reserva, InstruccionPagoMasivoCore instruccion) {
+        amount = positiveMoney(amount);
         adminGrpcClient.validateTransactionSubtypeActive(subtype, type.name());
         if (type == TipoMovimientoCuentaEnum.DEBITO) {
             c = findActiveAccount(c.getNumeroCuenta());
@@ -533,18 +716,43 @@ public class AccountService {
         return saved;
     }
 
-    private void registerCashJournal(TransaccionCuenta tx, boolean deposit) {
+    private String registerCashJournal(TransaccionCuenta tx, boolean deposit) {
         List<Map<String, Object>> lines = deposit
                 ? List.of(line(null, "BOVEDA_CENTRAL", "DEBITO", tx.getMonto(), "Ingreso de efectivo", 1), line(null, "CLIENTES_PASIVO", "CREDITO", tx.getMonto(), "Abono a cuenta cliente", 2))
                 : List.of(line(null, "CLIENTES_PASIVO", "DEBITO", tx.getMonto(), "Retiro de cuenta cliente", 1), line(null, "BOVEDA_CENTRAL", "CREDITO", tx.getMonto(), "Salida de efectivo", 2));
-        accountingGrpcClient.createJournalEntry(journal(tx, deposit ? "DEPOSITO_EFECTIVO" : "RETIRO_EFECTIVO", deposit ? "Depósito en efectivo" : "Retiro en efectivo", lines));
+        return accountingGrpcClient.createJournalEntry(journal(tx, deposit ? "DEPOSITO_EFECTIVO" : "RETIRO_EFECTIVO", deposit ? "Depósito en efectivo" : "Retiro en efectivo", lines));
     }
 
-    private void registerP2PJournal(TransaccionCuenta debit, TransaccionCuenta credit) {
+    private void registerTellerCompletedEvent(TransaccionCuenta tx, String eventType, String operationName, String customerEmail) {
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("correlationId", tx.getUuidCorrelacion());
+        payload.put("transactionUuid", tx.getUuidTransaccion());
+        payload.put("accountingEntryUuid", tx.getAsientoContableUuid());
+        payload.put("accountNumber", tx.getCuenta().getNumeroCuenta());
+        payload.put("customerUuid", tx.getCuenta().getUuidCliente());
+        payload.put("customerEmail", customerEmail);
+        payload.put("holderName", tx.getCuenta().getNombreTitularReferencia());
+        payload.put("amount", tx.getMonto());
+        payload.put("movementType", tx.getTipoMovimiento().name());
+        payload.put("operationName", operationName);
+        payload.put("receiptNumber", tx.getNumeroComprobante());
+        payload.put("accountingDate", tx.getFechaContable().toString());
+        payload.put("resultingAccountingBalance", tx.getSaldoContableResultante());
+        payload.put("resultingAvailableBalance", tx.getSaldoDisponibleResultante());
+        outboxEventService.registrar(
+                eventType,
+                "TRANSACCION_CUENTA",
+                tx.getUuidTransaccion(),
+                tx.getUuidCorrelacion(),
+                toJson(payload)
+        );
+    }
+
+    private String registerP2PJournal(TransaccionCuenta debit, TransaccionCuenta credit) {
         List<Map<String, Object>> lines = List.of(
                 line(null, "CLIENTES_PASIVO", "DEBITO", debit.getMonto(), "Débito cuenta origen " + debit.getCuenta().getNumeroCuenta(), 1),
                 line(null, "CLIENTES_PASIVO", "CREDITO", credit.getMonto(), "Crédito cuenta destino " + credit.getCuenta().getNumeroCuenta(), 2));
-        accountingGrpcClient.createJournalEntry(journal(debit, "TRANSFERENCIA_P2P", "Transferencia interna P2P", lines));
+        return accountingGrpcClient.createJournalEntry(journal(debit, "TRANSFERENCIA_P2P", "Transferencia interna P2P", lines));
     }
 
     private String registerOnUsPaymentJournal(TransaccionCuenta tx) {
@@ -570,13 +778,13 @@ public class AccountService {
         accountingGrpcClient.createJournalEntry(journal(tx, "COMISION_PAGOS_MASIVOS", "Cobro de comisión de pagos masivos", lines));
     }
 
-    private void registerGenericClientJournal(TransaccionCuenta tx, String operationType, String description) {
+    private String registerGenericClientJournal(TransaccionCuenta tx, String operationType, String description) {
         String debit = tx.getTipoMovimiento() == TipoMovimientoCuentaEnum.DEBITO ? "CLIENTES_PASIVO" : "BOVEDA_CENTRAL";
         String credit = tx.getTipoMovimiento() == TipoMovimientoCuentaEnum.DEBITO ? "BOVEDA_CENTRAL" : "CLIENTES_PASIVO";
         List<Map<String, Object>> lines = List.of(
                 line(null, debit, "DEBITO", tx.getMonto(), description, 1),
                 line(null, credit, "CREDITO", tx.getMonto(), description, 2));
-        accountingGrpcClient.createJournalEntry(journal(tx, operationType, description, lines));
+        return accountingGrpcClient.createJournalEntry(journal(tx, operationType, description, lines));
     }
 
     private Map<String, Object> journal(TransaccionCuenta tx, String operationType, String description, List<Map<String, Object>> lines) {
@@ -640,16 +848,84 @@ public class AccountService {
         outboxEventService.flush();
     }
 
+    private void validateAccountProductEligibility(AccountSubtypeResponse product,
+                                                   CustomerBasicGrpcResponse customer,
+                                                   PropositoCuentaEnum purpose,
+                                                   CreateAccountRequest request) {
+        if (!product.getAllowedCustomerTypesList().isEmpty()
+                && !product.getAllowedCustomerTypesList().contains(customer.getCustomerType())) {
+            throw new BusinessException("ACCOUNT_PRODUCT_CUSTOMER_TYPE_NOT_ALLOWED",
+                    "El producto no está habilitado para el tipo de cliente", HttpStatus.CONFLICT);
+        }
+        if (!product.getAllowedPurposesList().isEmpty()
+                && !product.getAllowedPurposesList().contains(purpose.name())) {
+            throw new BusinessException("ACCOUNT_PRODUCT_PURPOSE_NOT_ALLOWED",
+                    "El producto no admite el propósito de cuenta solicitado", HttpStatus.CONFLICT);
+        }
+        if (Boolean.TRUE.equals(request.massPaymentMainAccount()) && !product.getSupportsMassPayments()) {
+            throw new BusinessException("ACCOUNT_PRODUCT_MASS_PAYMENTS_NOT_SUPPORTED",
+                    "El producto no admite pagos masivos", HttpStatus.CONFLICT);
+        }
+        if (Boolean.TRUE.equals(request.favoritePaymentAccount())
+                && !product.getSupportsFavoritePaymentAccount()) {
+            throw new BusinessException("ACCOUNT_PRODUCT_FAVORITE_NOT_SUPPORTED",
+                    "El producto no puede utilizarse como cuenta favorita de pagos", HttpStatus.CONFLICT);
+        }
+    }
+
     private Cuenta findAccount(String number) { return cuentaRepository.findByNumeroCuenta(number).orElseThrow(() -> notFound("ACCOUNT_NOT_FOUND", "Cuenta no encontrada")); }
     private Cuenta findActiveAccount(String number) { Cuenta c = findAccount(number); if (c.getEstado() != EstadoCuentaEnum.ACTIVA) throw new BusinessException("ACCOUNT_NOT_ACTIVE", "La cuenta no está activa", HttpStatus.CONFLICT); return c; }
     private ReservaPagoMasivo findReservation(String uuid) { return reservaRepository.findByUuidReserva(uuid).orElseThrow(() -> notFound("ACCOUNT_RESERVATION_NOT_FOUND", "Reserva no encontrada")); }
     private BusinessException notFound(String code, String msg) { return new BusinessException(code, msg, HttpStatus.NOT_FOUND); }
     private void ensureAvailable(Cuenta c, BigDecimal amount) { if (c.getSaldoDisponible().compareTo(amount) < 0) throw new BusinessException("ACCOUNT_INSUFFICIENT_FUNDS", "Saldo disponible insuficiente", HttpStatus.CONFLICT); }
-    private BigDecimal money(BigDecimal v) { if (v == null || v.compareTo(ZERO) < 0) throw new BusinessException("ACCOUNT_INVALID_AMOUNT", "Monto inválido", HttpStatus.BAD_REQUEST); return v.setScale(2, RoundingMode.HALF_UP); }
+    private BigDecimal money(BigDecimal value) {
+        if (value == null || value.compareTo(ZERO) < 0) {
+            throw new BusinessException("ACCOUNT_INVALID_AMOUNT", "Monto inválido", HttpStatus.BAD_REQUEST);
+        }
+        return value.setScale(2, RoundingMode.HALF_UP);
+    }
+
+    private BigDecimal positiveMoney(BigDecimal value) {
+        BigDecimal normalized = money(value);
+        if (normalized.compareTo(ZERO) <= 0) {
+            throw new BusinessException("ACCOUNT_INVALID_AMOUNT", "El monto debe ser mayor a cero", HttpStatus.BAD_REQUEST);
+        }
+        return normalized;
+    }
     private LocalDate parseDate(String v) { return v == null || v.isBlank() ? accountingGrpcClient.getCurrentAccountingDate() : LocalDate.parse(v); }
     private void clearFavorite(String customerUuid) { cuentaRepository.findByUuidClienteAndEsCuentaFavoritaPagos(customerUuid, true).ifPresent(c -> { c.setEsCuentaFavoritaPagos(false); cuentaRepository.save(c); }); }
+
+    private String toJson(Map<String, Object> payload) {
+        try {
+            return objectMapper.writeValueAsString(payload);
+        } catch (Exception exception) {
+            throw new IllegalStateException("No fue posible serializar el evento de integración", exception);
+        }
+    }
+
+    private String normalizeRequired(String value, String code, String message) {
+        if (value == null || value.isBlank()) {
+            throw new BusinessException(code, message, HttpStatus.BAD_REQUEST);
+        }
+        return value.trim();
+    }
     private String generateAccountNumber(String branchCode) { return branchCode + String.format("%010d", System.currentTimeMillis() % 10000000000L); }
     private String defaultString(String value, String defaultValue) { return value == null || value.isBlank() ? defaultValue : value; }
+
+    private CanalOrigenCuentaEnum tellerChannel(String value) {
+        CanalOrigenCuentaEnum channel = value == null || value.isBlank()
+                ? CanalOrigenCuentaEnum.VENTANILLA
+                : parseEnum(value, CanalOrigenCuentaEnum.class,
+                        "ACCOUNT_TELLER_CHANNEL_INVALID",
+                        "Las operaciones de Teller deben utilizar el canal VENTANILLA");
+        if (channel != CanalOrigenCuentaEnum.VENTANILLA) {
+            throw new BusinessException(
+                    "ACCOUNT_TELLER_CHANNEL_INVALID",
+                    "Las operaciones de Teller deben utilizar el canal VENTANILLA",
+                    HttpStatus.BAD_REQUEST);
+        }
+        return channel;
+    }
 
     private String blankToNull(String value) { return value == null || value.isBlank() ? null : value.trim(); }
 

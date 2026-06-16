@@ -7,6 +7,8 @@ import org.slf4j.LoggerFactory;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
+import org.springframework.orm.ObjectOptimisticLockingFailureException;
+import org.springframework.security.access.AccessDeniedException;
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
@@ -66,6 +68,18 @@ public class GlobalExceptionHandler {
         ));
     }
 
+    @ExceptionHandler(ObjectOptimisticLockingFailureException.class)
+    public ResponseEntity<ErrorResponse> handleOptimisticLock(ObjectOptimisticLockingFailureException ex) {
+        log.warn("Concurrent modification detected. correlationId={}", CorrelationIdHolder.get(), ex);
+        return ResponseEntity.status(HttpStatus.CONFLICT).body(new ErrorResponse(
+                LocalDateTime.now(),
+                CorrelationIdHolder.get(),
+                "ACCOUNT_CONCURRENT_MODIFICATION",
+                "La operación coincidió con otra actualización sobre el mismo recurso. Consulte su estado antes de reintentar.",
+                List.of()
+        ));
+    }
+
     @ExceptionHandler(NoResourceFoundException.class)
     public ResponseEntity<ErrorResponse> handleNoResource(NoResourceFoundException ex) {
         return ResponseEntity.status(HttpStatus.NOT_FOUND).body(new ErrorResponse(
@@ -74,6 +88,17 @@ public class GlobalExceptionHandler {
                 "RESOURCE_NOT_FOUND",
                 "Recurso no encontrado",
                 List.of(ex.getResourcePath())
+        ));
+    }
+
+    @ExceptionHandler(AccessDeniedException.class)
+    public ResponseEntity<ErrorResponse> handleAccessDenied(AccessDeniedException ex) {
+        return ResponseEntity.status(HttpStatus.FORBIDDEN).body(new ErrorResponse(
+                LocalDateTime.now(),
+                CorrelationIdHolder.get(),
+                "SECURITY_ACCESS_DENIED",
+                "Acceso denegado. El token no posee permisos para este recurso.",
+                List.of()
         ));
     }
 

@@ -21,7 +21,16 @@ public class AdminGrpcClient {
     @PostConstruct public void init() { channel = ManagedChannelBuilder.forAddress(host, port).usePlaintext().build(); stub = AdminCatalogServiceGrpc.newBlockingStub(channel); }
     @PreDestroy public void shutdown() { if (channel != null) channel.shutdown(); }
     public void validateBranchActive(String code) { var r = call(() -> stub.getBranchByCode(BranchCodeRequest.newBuilder().setCode(code).build()), "ADMIN_GRPC_BRANCH_ERROR"); if (!"ACTIVA".equals(r.getStatus())) throw new BusinessException("ADMIN_BRANCH_NOT_ACTIVE", "La sucursal no está activa", HttpStatus.CONFLICT); }
-    public void validateAccountSubtypeActive(String code) { var r = call(() -> stub.getAccountSubtype(AccountSubtypeCodeRequest.newBuilder().setCode(code).build()), "ADMIN_GRPC_ACCOUNT_SUBTYPE_ERROR"); if (!"ACTIVO".equals(r.getStatus())) throw new BusinessException("ADMIN_ACCOUNT_SUBTYPE_NOT_ACTIVE", "El subtipo de cuenta no está activo", HttpStatus.CONFLICT); }
+    public AccountSubtypeResponse getActiveAccountSubtype(String code) {
+        var response = call(() -> stub.getAccountSubtype(
+                AccountSubtypeCodeRequest.newBuilder().setCode(code).build()),
+                "ADMIN_GRPC_ACCOUNT_SUBTYPE_ERROR");
+        if (!"ACTIVO".equals(response.getStatus())) {
+            throw new BusinessException("ADMIN_ACCOUNT_SUBTYPE_NOT_ACTIVE", "El subtipo de cuenta no está activo", HttpStatus.CONFLICT);
+        }
+        return response;
+    }
+    public void validateAccountSubtypeActive(String code) { getActiveAccountSubtype(code); }
     public void validateTransactionSubtypeActive(String code, String expectedMovementType) { var r = call(() -> stub.getTransactionSubtype(TransactionSubtypeCodeRequest.newBuilder().setCode(code).build()), "ADMIN_GRPC_TRANSACTION_SUBTYPE_ERROR"); if (!"ACTIVO".equals(r.getStatus())) throw new BusinessException("ADMIN_TRANSACTION_SUBTYPE_NOT_ACTIVE", "El subtipo de transacción no está activo", HttpStatus.CONFLICT); if (expectedMovementType != null && !expectedMovementType.equals(r.getBaseMovementType())) throw new BusinessException("ADMIN_TRANSACTION_SUBTYPE_MOVEMENT_MISMATCH", "El subtipo de transacción no corresponde al tipo de movimiento esperado", HttpStatus.CONFLICT); }
     public BigDecimal getIvaRate() { var r = call(() -> stub.getIvaRate(EmptyRequest.newBuilder().build()), "ADMIN_GRPC_IVA_ERROR"); return new BigDecimal(r.getValue()); }
     private <T> T call(GrpcCall<T> call, String code) { try { return call.execute(); } catch (StatusRuntimeException e) { throw translate(code, "Error de catálogo administrativo vía gRPC", e); } }

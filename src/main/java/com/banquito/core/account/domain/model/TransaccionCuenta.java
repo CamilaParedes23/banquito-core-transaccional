@@ -67,6 +67,10 @@ public class TransaccionCuenta {
     private String numeroComprobante;
     @Column(name = "UUID_DOCUMENTO_COMPROBANTE", length = 36)
     private String uuidDocumentoComprobante;
+    @Column(name = "MOTIVO_REVERSO", length = 300)
+    private String motivoReverso;
+    @Column(name = "UUID_USUARIO_REVERSO", length = 36)
+    private String uuidUsuarioReverso;
     @Column(name = "FECHA_CREACION", nullable = false)
     private LocalDateTime fechaCreacion;
     @Version

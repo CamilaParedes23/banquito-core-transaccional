@@ -1,3 +1,24 @@
 package com.banquito.core.account.api.dto.api;
 
-public record AccountTransactionResponse(String transactionUuid, String accountNumber, String subtypeCode, String movementType, java.math.BigDecimal amount, java.math.BigDecimal resultingAccountingBalance, java.math.BigDecimal resultingAvailableBalance, String status, String channel, String externalReference, java.time.LocalDate accountingDate, java.time.LocalDateTime timestamp) {}
+import java.math.BigDecimal;
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+
+public record AccountTransactionResponse(
+        String transactionUuid,
+        String accountNumber,
+        String subtypeCode,
+        String movementType,
+        BigDecimal amount,
+        BigDecimal resultingAccountingBalance,
+        BigDecimal resultingAvailableBalance,
+        String status,
+        String channel,
+        String externalReference,
+        LocalDate accountingDate,
+        LocalDateTime timestamp,
+        String receiptNumber,
+        String documentReceiptUuid,
+        String correlationId,
+        String reversedTransactionUuid
+) {}

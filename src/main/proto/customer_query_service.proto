@@ -37,6 +37,7 @@ message CustomerBasicGrpcResponse {
   string display_name = 5;
   string status = 6;
   bool mass_payments_enabled = 7;
+  string email = 8;
 }
 
 message ValidationGrpcResponse {

@@ -1,0 +1,61 @@
+syntax = "proto3";
+
+package banquito.platform.notification.v1;
+
+option java_multiple_files = true;
+option java_package = "com.banquito.platform.notification.grpc";
+option java_outer_classname = "NotificationServiceProto";
+
+service NotificationInternalService {
+  rpc SendTemplatedNotification (SendTemplatedNotificationRequest) returns (NotificationReply);
+  rpc GetNotificationStatus (GetNotificationStatusRequest) returns (NotificationStatusReply);
+  rpc RegisterNotificationEvent (RegisterNotificationEventRequest) returns (NotificationReply);
+}
+
+message SendTemplatedNotificationRequest {
+  string correlation_id = 1;
+  string event_type = 2;
+  string origin_service = 3;
+  string channel_type = 4;
+  string recipient = 5;
+  string recipient_name = 6;
+  string template_code = 7;
+  string payload_json = 8;
+  string source_event_uuid = 9;
+  string priority = 10;
+  string actor_uuid = 11;
+  string actor_type = 12;
+  string subject = 13;
+  string body = 14;
+  string evidence_document_uuid = 15;
+}
+
+message RegisterNotificationEventRequest {
+  string correlation_id = 1;
+  string event_type = 2;
+  string origin_service = 3;
+  string channel_type = 4;
+  string recipient = 5;
+  string subject = 6;
+  string body = 7;
+  string recipient_name = 8;
+  string priority = 9;
+  string evidence_document_uuid = 10;
+}
+
+message GetNotificationStatusRequest {
+  string notification_uuid = 1;
+}
+
+message NotificationReply {
+  string notification_uuid = 1;
+  string status = 2;
+  string message = 3;
+}
+
+message NotificationStatusReply {
+  string notification_uuid = 1;
+  string status = 2;
+  string sent_at = 3;
+  int32 attempts = 4;
+}

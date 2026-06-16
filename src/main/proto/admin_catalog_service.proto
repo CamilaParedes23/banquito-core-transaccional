@@ -71,6 +71,11 @@ message AccountSubtypeResponse {
   string base_type = 2;
   string name = 3;
   string status = 4;
+  repeated string allowed_customer_types = 5;
+  repeated string allowed_purposes = 6;
+  bool supports_mass_payments = 7;
+  bool supports_favorite_payment_account = 8;
+  string minimum_opening_balance = 9;
 }
 
 message TransactionSubtypeResponse {
