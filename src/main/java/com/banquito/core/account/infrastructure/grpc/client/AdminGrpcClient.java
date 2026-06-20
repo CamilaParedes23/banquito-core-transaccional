@@ -31,7 +31,53 @@ public class AdminGrpcClient {
         return response;
     }
     public void validateAccountSubtypeActive(String code) { getActiveAccountSubtype(code); }
-    public void validateTransactionSubtypeActive(String code, String expectedMovementType) { var r = call(() -> stub.getTransactionSubtype(TransactionSubtypeCodeRequest.newBuilder().setCode(code).build()), "ADMIN_GRPC_TRANSACTION_SUBTYPE_ERROR"); if (!"ACTIVO".equals(r.getStatus())) throw new BusinessException("ADMIN_TRANSACTION_SUBTYPE_NOT_ACTIVE", "El subtipo de transacción no está activo", HttpStatus.CONFLICT); if (expectedMovementType != null && !expectedMovementType.equals(r.getBaseMovementType())) throw new BusinessException("ADMIN_TRANSACTION_SUBTYPE_MOVEMENT_MISMATCH", "El subtipo de transacción no corresponde al tipo de movimiento esperado", HttpStatus.CONFLICT); }
+    public TransactionSubtypeResponse getTransactionSubtype(String code) {
+        return call(() -> stub.getTransactionSubtype(
+                TransactionSubtypeCodeRequest.newBuilder().setCode(code).build()),
+                "ADMIN_GRPC_TRANSACTION_SUBTYPE_ERROR");
+    }
+    public void validateTransactionSubtypeActive(String code, String expectedMovementType) {
+        var r = getTransactionSubtype(code);
+        if (!"ACTIVO".equals(r.getStatus())) {
+            throw new BusinessException("ADMIN_TRANSACTION_SUBTYPE_NOT_ACTIVE", "El subtipo de transacción no está activo", HttpStatus.CONFLICT);
+        }
+        if (expectedMovementType != null && !expectedMovementType.equals(r.getBaseMovementType())) {
+            throw new BusinessException("ADMIN_TRANSACTION_SUBTYPE_MOVEMENT_MISMATCH", "El subtipo de transacción no corresponde al tipo de movimiento esperado", HttpStatus.CONFLICT);
+        }
+    }
+    public String getTransactionSubtypeName(String code) {
+        try {
+            var response = getTransactionSubtype(code);
+            return response.getName().isBlank() ? code : response.getName();
+        } catch (BusinessException exception) {
+            return code;
+        }
+    }
+    public FinancialInstitutionResponse getActiveInstitution(String routingCode) {
+        var response = call(() -> stub.getInstitutionByRoutingCode(
+                        RoutingCodeRequest.newBuilder().setRoutingCode(routingCode).build()),
+                "ADMIN_GRPC_INSTITUTION_ERROR");
+        if (!"ACTIVA".equals(response.getStatus())) {
+            throw new BusinessException(
+                    "ADMIN_INSTITUTION_NOT_ACTIVE",
+                    "La institución financiera no está activa",
+                    HttpStatus.CONFLICT);
+        }
+        return response;
+    }
+
+    public void validateRoutingCode(String routingCode, boolean expectedBanquito) {
+        FinancialInstitutionResponse institution = getActiveInstitution(routingCode);
+        if (institution.getBanquito() != expectedBanquito) {
+            throw new BusinessException(
+                    "ACCOUNT_ROUTING_DESTINATION_MISMATCH",
+                    expectedBanquito
+                            ? "El routing code no corresponde a Banco BanQuito para una instrucción On-Us"
+                            : "El routing code corresponde a Banco BanQuito y no puede usarse como destino Off-Us",
+                    HttpStatus.CONFLICT);
+        }
+    }
+
     public BigDecimal getIvaRate() { var r = call(() -> stub.getIvaRate(EmptyRequest.newBuilder().build()), "ADMIN_GRPC_IVA_ERROR"); return new BigDecimal(r.getValue()); }
     private <T> T call(GrpcCall<T> call, String code) { try { return call.execute(); } catch (StatusRuntimeException e) { throw translate(code, "Error de catálogo administrativo vía gRPC", e); } }
     private BusinessException translate(String code, String fallback, StatusRuntimeException e) { String desc = e.getStatus().getDescription(); if (desc != null && desc.contains("|")) { String[] parts = desc.split("\\|",2); return new BusinessException(parts[0], parts[1], HttpStatus.CONFLICT); } return new BusinessException(code, fallback + ": " + (desc == null ? e.getStatus().getCode() : desc), HttpStatus.CONFLICT); }

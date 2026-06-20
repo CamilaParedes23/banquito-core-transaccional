@@ -40,6 +40,10 @@ public class ReservaPagoMasivo {
     private BigDecimal montoTotalLote;
     @Column(name = "MONTO_COMISION", precision = 19, scale = 2, nullable = false)
     private BigDecimal montoComision;
+    @Column(name = "MONTO_COMISION_COBRADO", precision = 19, scale = 2, nullable = false)
+    private BigDecimal montoComisionCobrado;
+    @Column(name = "COMISION_LIQUIDADA", nullable = false)
+    private Boolean comisionLiquidada;
     @Column(name = "MONTO_RESERVADO", precision = 19, scale = 2, nullable = false)
     private BigDecimal montoReservado;
     @Column(name = "MONTO_CONSUMIDO_ONUS", precision = 19, scale = 2, nullable = false)
@@ -50,6 +54,8 @@ public class ReservaPagoMasivo {
     private BigDecimal montoLiberado;
     @Column(name = "ASIENTO_RESERVA_UUID", length = 36)
     private String asientoReservaUuid;
+    @Column(name = "UUID_TRANSACCION_FONDEO", length = 36)
+    private String uuidTransaccionFondeo;
     @Enumerated(EnumType.STRING)
     @Column(name = "ESTADO", length = 25, nullable = false)
     private EstadoReservaPagoMasivoEnum estado;
@@ -59,6 +65,8 @@ public class ReservaPagoMasivo {
     private LocalDateTime fechaCreacion;
     @Column(name = "FECHA_ACTUALIZACION", nullable = false)
     private LocalDateTime fechaActualizacion;
+    @Column(name = "FECHA_CIERRE")
+    private LocalDateTime fechaCierre;
     @Version
     @Column(name = "VERSION", nullable = false)
     private Integer version;

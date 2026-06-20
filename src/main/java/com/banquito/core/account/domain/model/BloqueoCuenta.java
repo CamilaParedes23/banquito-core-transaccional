@@ -38,6 +38,8 @@ public class BloqueoCuenta {
     private String uuidUsuarioCore;
     @Column(name = "FECHA_BLOQUEO", nullable = false)
     private LocalDateTime fechaBloqueo;
+    @Column(name = "FECHA_EXPIRACION")
+    private LocalDateTime fechaExpiracion;
     @Column(name = "FECHA_LIBERACION")
     private LocalDateTime fechaLiberacion;
     @Version

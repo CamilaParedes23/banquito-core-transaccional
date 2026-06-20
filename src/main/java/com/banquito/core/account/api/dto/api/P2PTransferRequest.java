@@ -11,7 +11,7 @@ public record P2PTransferRequest(
         @NotBlank @Size(max = 24) String sourceAccountNumber,
         @NotBlank @Size(max = 24) String targetAccountNumber,
         @NotNull @DecimalMin(value = "0.01") BigDecimal amount,
-        @Size(max = 300) String description,
+        @Size(max = 120) String description,
         String accountingDate,
         @Size(max = 36) String correlationId
 ) {}

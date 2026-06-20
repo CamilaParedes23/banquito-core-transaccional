@@ -7,6 +7,7 @@ option java_multiple_files = true;
 
 service AccountingService {
   rpc GetCurrentAccountingDate(CurrentAccountingDateRequest) returns (AccountingDateReply);
+  rpc ResolveOperationAccountingDate(CurrentAccountingDateRequest) returns (AccountingDateReply);
   rpc CreateJournalEntry(CreateJournalEntryRequest) returns (JournalEntryReply);
   rpc CreateReversalJournalEntry(CreateReversalJournalEntryRequest) returns (JournalEntryReply);
   rpc GetInstitutionalAccountByFunctionalCode(InstitutionalAccountRequest) returns (InstitutionalAccountReply);

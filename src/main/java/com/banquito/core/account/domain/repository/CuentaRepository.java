@@ -4,6 +4,8 @@ import com.banquito.core.account.domain.model.*;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
 import org.springframework.data.jpa.repository.JpaRepository;
+import jakarta.persistence.LockModeType;
+import org.springframework.data.jpa.repository.Lock;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 import java.util.*;
@@ -13,6 +15,14 @@ public interface CuentaRepository extends JpaRepository<Cuenta, Long> {
 
     Optional<Cuenta> findByNumeroCuenta(String numeroCuenta);
     Optional<Cuenta> findByUuidCuenta(String uuidCuenta);
+    @Lock(LockModeType.PESSIMISTIC_WRITE)
+    @Query("select c from Cuenta c where c.numeroCuenta = :numeroCuenta")
+    Optional<Cuenta> findByNumeroCuentaForUpdate(@Param("numeroCuenta") String numeroCuenta);
+
+    @Lock(LockModeType.PESSIMISTIC_WRITE)
+    @Query("select c from Cuenta c where c.id = :id")
+    Optional<Cuenta> findByIdForUpdate(@Param("id") Long id);
+
     List<Cuenta> findByUuidClienteOrderByFechaAperturaDesc(String uuidCliente);
     List<Cuenta> findByUuidClienteAndEstadoOrderByFechaAperturaDesc(String uuidCliente, EstadoCuentaEnum estado);
     List<Cuenta> findByUuidClienteAndPropositoCuentaOrderByFechaAperturaDesc(String uuidCliente, PropositoCuentaEnum propositoCuenta);
@@ -38,7 +48,7 @@ public interface CuentaRepository extends JpaRepository<Cuenta, Long> {
                     LOWER(c.nombreTitularReferencia) LIKE LOWER(CONCAT('%', :search, '%')) OR
                     LOWER(COALESCE(c.aliasOperativo, '')) LIKE LOWER(CONCAT('%', :search, '%'))
                   )
-            ORDER BY c.fechaApertura DESC
+            ORDER BY c.fechaApertura DESC, c.id DESC
             """,
             countQuery = """
             SELECT COUNT(c)

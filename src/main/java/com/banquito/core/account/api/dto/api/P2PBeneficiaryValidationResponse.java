@@ -4,6 +4,7 @@ public record P2PBeneficiaryValidationResponse(
         boolean accountExists,
         String accountStatus,
         String holderDisplayName,
+        String maskedAccountNumber,
         String institution
 ) {
 }

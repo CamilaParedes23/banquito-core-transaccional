@@ -22,7 +22,8 @@ public class OutboxIntegrationDispatcher {
     private static final Logger log = LoggerFactory.getLogger(OutboxIntegrationDispatcher.class);
     private static final List<String> SUPPORTED_EVENTS =
             List.of("P2P_TRANSFER_COMPLETED", "ONUS_PAYMENT_COMPLETED",
-                    "TELLER_DEPOSIT_COMPLETED", "TELLER_WITHDRAWAL_COMPLETED");
+                    "TELLER_DEPOSIT_COMPLETED", "TELLER_WITHDRAWAL_COMPLETED",
+                    "ACCOUNT_OPENING_FUNDED");
 
     private final OutboxEventService outboxEventService;
     private final NotificationInternalClient notificationClient;
@@ -70,6 +71,8 @@ public class OutboxIntegrationDispatcher {
                 } else if ("TELLER_DEPOSIT_COMPLETED".equals(event.getTipoEvento())
                         || "TELLER_WITHDRAWAL_COMPLETED".equals(event.getTipoEvento())) {
                     dispatchTeller(event, payload);
+                } else if ("ACCOUNT_OPENING_FUNDED".equals(event.getTipoEvento())) {
+                    dispatchAccountOpening(event, payload);
                 }
                 outboxEventService.markPublished(event.getId());
             } catch (Exception exception) {
@@ -175,6 +178,48 @@ public class OutboxIntegrationDispatcher {
                         "comprobante", string(payload, "receiptNumber")
                 )
         ));
+    }
+
+    private void dispatchAccountOpening(OutboxEvent event, Map<String, Object> payload) throws Exception {
+        String transactionUuid = string(payload, "transactionUuid");
+        String canonicalReceipt = objectMapper.writeValueAsString(payload);
+        String documentUuid = documentClient.registerReceipt(
+                event.getUuidEvento(),
+                string(payload, "correlationId"),
+                "ACCOUNT_OPENING",
+                "comprobante-apertura-" + transactionUuid + ".json",
+                canonicalReceipt,
+                Map.of(
+                        "operationType", "DEPOSITO_APERTURA_CUENTA",
+                        "transactionUuid", transactionUuid,
+                        "accountUuid", string(payload, "accountUuid"),
+                        "receiptNumber", string(payload, "receiptNumber")
+                )
+        );
+        documentLinkService.link(documentUuid, transactionUuid);
+
+        Map<String, Object> request = notification(
+                event,
+                payload,
+                "ACCOUNT_OPENING_FUNDED",
+                string(payload, "customerUuid"),
+                "CLIENTE",
+                nullableString(payload, "customerEmail"),
+                string(payload, "holderName"),
+                null,
+                documentUuid,
+                Map.of(
+                        "nombre", string(payload, "holderName"),
+                        "monto", amount(payload),
+                        "cuenta", string(payload, "accountNumber"),
+                        "comprobante", string(payload, "receiptNumber")
+                )
+        );
+        request.put("subject", "Cuenta abierta con depósito inicial");
+        request.put("body", "Se abrió la cuenta " + string(payload, "accountNumber")
+                + " con un depósito inicial de " + amount(payload)
+                + ". Comprobante: " + string(payload, "receiptNumber"));
+        notificationClient.request(request);
     }
 
     private void dispatchTeller(OutboxEvent event, Map<String, Object> payload) throws Exception {

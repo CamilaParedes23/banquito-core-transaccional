@@ -12,6 +12,7 @@ import java.util.*;
 public interface TransaccionCuentaRepository extends JpaRepository<TransaccionCuenta, Long> {
 
     Optional<TransaccionCuenta> findByUuidTransaccion(String uuidTransaccion);
+    Optional<TransaccionCuenta> findByNumeroComprobante(String numeroComprobante);
 
     /**
      * Serializa cambios sobre una transacción financiera cuando pueden concurrir

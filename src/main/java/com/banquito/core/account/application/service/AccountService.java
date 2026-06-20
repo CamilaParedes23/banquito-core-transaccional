@@ -34,6 +34,8 @@ public class AccountService {
     private static final Logger log = LoggerFactory.getLogger(AccountService.class);
     private static final BigDecimal ZERO = BigDecimal.ZERO;
     private static final BigDecimal ONE_HUNDRED = new BigDecimal("100.00");
+    private static final String OPENING_DEPOSIT_SUBTYPE = "DEP_APERTURA_CUENTA";
+    private static final String OPENING_DEPOSIT_DESCRIPTION = "Depósito inicial de apertura";
 
     private final CuentaRepository cuentaRepository;
     private final TransaccionCuentaRepository transaccionRepository;
@@ -47,6 +49,7 @@ public class AccountService {
     private final CustomerGrpcClient customerGrpcClient;
     private final AdminGrpcClient adminGrpcClient;
     private final AccountingGrpcClient accountingGrpcClient;
+    private final AccountBlockExpirationService blockExpirationService;
     private final TransactionTemplate transactionTemplate;
     private final ObjectMapper objectMapper;
 
@@ -62,6 +65,7 @@ public class AccountService {
                           CustomerGrpcClient customerGrpcClient,
                           AdminGrpcClient adminGrpcClient,
                           AccountingGrpcClient accountingGrpcClient,
+                          AccountBlockExpirationService blockExpirationService,
                           PlatformTransactionManager transactionManager,
                           ObjectMapper objectMapper) {
         this.cuentaRepository = cuentaRepository;
@@ -76,6 +80,7 @@ public class AccountService {
         this.customerGrpcClient = customerGrpcClient;
         this.adminGrpcClient = adminGrpcClient;
         this.accountingGrpcClient = accountingGrpcClient;
+        this.blockExpirationService = blockExpirationService;
         this.transactionTemplate = new TransactionTemplate(transactionManager);
         this.objectMapper = objectMapper;
     }
@@ -144,23 +149,59 @@ public class AccountService {
     @Transactional(readOnly = true)
     public AccountResponse getByNumber(String accountNumber) { return AccountMapper.toResponse(findAccount(accountNumber)); }
 
-    @Transactional(readOnly = true)
-    public BalanceResponse getBalance(String accountNumber) { return AccountMapper.toBalance(findAccount(accountNumber)); }
+    @Transactional
+    public BalanceResponse getBalance(String accountNumber) {
+        blockExpirationService.expireForAccount(accountNumber);
+        return AccountMapper.toBalance(findAccount(accountNumber));
+    }
 
     @Transactional(readOnly = true)
     public List<AccountTransactionResponse> getTransactions(String accountNumber) {
         Cuenta cuenta = findAccount(accountNumber);
-        return transaccionRepository.findTop20ByCuentaOrderByTimestampTransaccionDesc(cuenta)
-                .stream()
-                .map(AccountMapper::toTransaction)
-                .toList();
+        return toTransactionResponses(
+                transaccionRepository.findTop20ByCuentaOrderByTimestampTransaccionDesc(cuenta));
     }
 
     @Transactional(readOnly = true)
     public AccountTransactionResponse getTransaction(String transactionUuid) {
         TransaccionCuenta transaction = transaccionRepository.findByUuidTransaccion(transactionUuid)
                 .orElseThrow(() -> notFound("ACCOUNT_TRANSACTION_NOT_FOUND", "Transacción no encontrada"));
-        return AccountMapper.toTransaction(transaction);
+        return toTransactionResponse(transaction);
+    }
+
+    @Transactional
+    public List<BlockResponse> listBlocks(String accountNumber, String status) {
+        blockExpirationService.expireForAccount(accountNumber);
+        Cuenta account = findAccount(accountNumber);
+        EstadoBloqueoCuentaEnum blockStatus = parseEnum(
+                status,
+                EstadoBloqueoCuentaEnum.class,
+                "ACCOUNT_BLOCK_STATUS_INVALID",
+                "Estado de bloqueo inválido");
+        List<BloqueoCuenta> blocks = blockStatus == null
+                ? bloqueoRepository.findByCuentaOrderByFechaBloqueoDesc(account)
+                : bloqueoRepository.findByCuentaAndEstadoOrderByFechaBloqueoDesc(account, blockStatus);
+        return blocks.stream().map(AccountMapper::toBlock).toList();
+    }
+
+    @Transactional(readOnly = true)
+    public List<AccountStatusHistoryResponse> listStatusHistory(String accountNumber) {
+        Cuenta account = findAccount(accountNumber);
+        return historialRepository.findByCuentaOrderByFechaCambioDesc(account)
+                .stream()
+                .map(AccountMapper::toStatusHistory)
+                .toList();
+    }
+
+    @Transactional(readOnly = true)
+    public AccountTransactionResponse getTransactionByReceipt(String receiptNumber) {
+        String normalizedReceipt = normalizeRequired(
+                receiptNumber,
+                "ACCOUNT_RECEIPT_NUMBER_REQUIRED",
+                "El número de comprobante es obligatorio");
+        TransaccionCuenta transaction = transaccionRepository.findByNumeroComprobante(normalizedReceipt)
+                .orElseThrow(() -> notFound("ACCOUNT_TRANSACTION_NOT_FOUND", "Transacción no encontrada"));
+        return toTransactionResponse(transaction);
     }
 
     @Transactional
@@ -201,55 +242,183 @@ public class AccountService {
         c.setCodigoSucursal(r.branchCode());
         c.setCodigoSubtipoCuenta(r.subtypeCode());
         c.setEstado(EstadoCuentaEnum.ACTIVA);
-        c.setSaldoContable(initial);
-        c.setSaldoDisponible(initial);
-        c.setMontoRetenido(ZERO);
+        // La cuenta nace siempre en cero. Si existe fondeo inicial, se aplica como
+        // una transacción financiera trazable dentro de esta misma transacción local.
+        c.setSaldoContable(ZERO.setScale(2, RoundingMode.HALF_UP));
+        c.setSaldoDisponible(ZERO.setScale(2, RoundingMode.HALF_UP));
+        c.setMontoRetenido(ZERO.setScale(2, RoundingMode.HALF_UP));
         c.setPermiteSobregiro(false);
-        c.setLimiteSobregiro(ZERO);
+        c.setLimiteSobregiro(ZERO.setScale(2, RoundingMode.HALF_UP));
         c.setEsCuentaMatrizPagos(Boolean.TRUE.equals(r.massPaymentMainAccount()));
         c.setEsCuentaFavoritaPagos(Boolean.TRUE.equals(r.favoritePaymentAccount()));
-        c.setAliasOperativo(r.operationalAlias());
+        c.setAliasOperativo(blankToNull(r.operationalAlias()));
         c.setPropositoCuenta(purpose);
         c.setFechaApertura(LocalDateTime.now());
         c.setFechaActualizacion(LocalDateTime.now());
         if (Boolean.TRUE.equals(c.getEsCuentaFavoritaPagos())) clearFavorite(c.getUuidCliente());
         Cuenta saved = cuentaRepository.saveAndFlush(c);
-        auditoriaService.registrar("CREATE_ACCOUNT", "CUENTA", saved.getUuidCuenta(), ResultadoAuditoriaAccountEnum.OK, null);
-        outboxEventService.registrar("ACCOUNT_CREATED", "CUENTA", saved.getUuidCuenta(), "{\"accountNumber\":\"" + saved.getNumeroCuenta() + "\"}");
+
+        if (initial.compareTo(ZERO) > 0) {
+            LocalDate accountingDate = accountingGrpcClient.resolveOperationAccountingDate();
+            String correlationId = CorrelationIdHolder.get();
+            TransaccionCuenta openingDeposit = applyMovement(
+                    saved,
+                    TipoMovimientoCuentaEnum.CREDITO,
+                    initial,
+                    OPENING_DEPOSIT_SUBTYPE,
+                    CanalOrigenCuentaEnum.VENTANILLA,
+                    OPENING_DEPOSIT_DESCRIPTION,
+                    accountingDate,
+                    correlationId,
+                    null,
+                    null);
+            openingDeposit.setAsientoContableUuid(registerOpeningDepositJournal(openingDeposit));
+            transaccionRepository.saveAndFlush(openingDeposit);
+            registerOpeningDepositCompletedEvent(openingDeposit, customer.getEmail());
+        }
+
+        auditoriaService.registrar(
+                "CREATE_ACCOUNT",
+                "CUENTA",
+                saved.getUuidCuenta(),
+                ResultadoAuditoriaAccountEnum.OK,
+                toJson(Map.of(
+                        "accountNumber", saved.getNumeroCuenta(),
+                        "initialBalance", initial)));
+        outboxEventService.registrar(
+                "ACCOUNT_CREATED",
+                "CUENTA",
+                saved.getUuidCuenta(),
+                toJson(Map.of(
+                        "accountNumber", saved.getNumeroCuenta(),
+                        "initialBalance", initial)));
         return AccountMapper.toResponse(saved);
     }
 
     @Transactional
-    public AccountResponse updateStatus(String accountNumber, UpdateAccountStatusRequest r) {
-        Cuenta c = findAccount(accountNumber);
-        EstadoCuentaEnum old = c.getEstado();
-        EstadoCuentaEnum next = EstadoCuentaEnum.valueOf(r.status());
-        c.setEstado(next);
-        c.setFechaActualizacion(LocalDateTime.now());
-        cuentaRepository.save(c);
-        HistorialEstadoCuenta h = new HistorialEstadoCuenta();
-        h.setCuenta(c);
-        h.setEstadoAnterior(old);
-        h.setEstadoNuevo(next);
-        h.setMotivoCambio(r.reason());
-        h.setUuidUsuarioCore(r.userCoreUuid());
-        h.setFechaCambio(LocalDateTime.now());
-        historialRepository.save(h);
-        return AccountMapper.toResponse(c);
+    public AccountResponse updateStatus(String accountNumber, UpdateAccountStatusRequest request, String actorUuid) {
+        Cuenta account = findAccount(accountNumber);
+        EstadoCuentaEnum previousStatus = account.getEstado();
+        EstadoCuentaEnum newStatus = parseEnum(
+                request.status(),
+                EstadoCuentaEnum.class,
+                "ACCOUNT_INVALID_STATUS",
+                "Estado de cuenta inválido");
+        if (newStatus == EstadoCuentaEnum.CERRADA) {
+            throw new BusinessException(
+                    "ACCOUNT_CLOSURE_REQUIRES_DEDICATED_PROCESS",
+                    "El cierre definitivo requiere un proceso especializado",
+                    HttpStatus.CONFLICT);
+        }
+        if (previousStatus == newStatus) {
+            throw new BusinessException(
+                    "ACCOUNT_STATUS_UNCHANGED",
+                    "La cuenta ya se encuentra en el estado solicitado",
+                    HttpStatus.CONFLICT);
+        }
+        validateStatusTransition(previousStatus, newStatus);
+
+        account.setEstado(newStatus);
+        account.setFechaActualizacion(LocalDateTime.now());
+        cuentaRepository.save(account);
+
+        HistorialEstadoCuenta history = new HistorialEstadoCuenta();
+        history.setCuenta(account);
+        history.setEstadoAnterior(previousStatus);
+        history.setEstadoNuevo(newStatus);
+        history.setMotivoCambio(request.reason().trim());
+        history.setUuidUsuarioCore(normalizeActor(actorUuid));
+        history.setFechaCambio(LocalDateTime.now());
+        historialRepository.save(history);
+
+        Map<String, Object> detail = new LinkedHashMap<>();
+        detail.put("accountNumber", account.getNumeroCuenta());
+        detail.put("previousStatus", previousStatus.name());
+        detail.put("newStatus", newStatus.name());
+        detail.put("reason", request.reason().trim());
+        detail.put("actorUuid", normalizeActor(actorUuid));
+        auditoriaService.registrar(
+                "UPDATE_ACCOUNT_STATUS",
+                "CUENTA",
+                account.getUuidCuenta(),
+                ResultadoAuditoriaAccountEnum.OK,
+                toJson(detail));
+        outboxEventService.registrar(
+                "ACCOUNT_STATUS_CHANGED",
+                "CUENTA",
+                account.getUuidCuenta(),
+                CorrelationIdHolder.get(),
+                toJson(detail));
+        return AccountMapper.toResponse(account);
     }
 
     @Transactional
-    public AccountResponse updatePaymentSettings(String accountNumber, UpdatePaymentSettingsRequest r) {
-        Cuenta c = findAccount(accountNumber);
-        if (r.favoritePaymentAccount() != null) {
-            if (r.favoritePaymentAccount()) clearFavorite(c.getUuidCliente());
-            c.setEsCuentaFavoritaPagos(r.favoritePaymentAccount());
+    public AccountResponse updatePaymentSettings(String accountNumber, UpdatePaymentSettingsRequest request) {
+        Cuenta account = findAccount(accountNumber);
+        CustomerBasicGrpcResponse customer = customerGrpcClient.getByUuid(account.getUuidCliente());
+        AccountSubtypeResponse product = adminGrpcClient.getActiveAccountSubtype(account.getCodigoSubtipoCuenta());
+        PropositoCuentaEnum purpose = request.accountPurpose() == null
+                ? account.getPropositoCuenta()
+                : parseEnum(request.accountPurpose(), PropositoCuentaEnum.class,
+                        "ACCOUNT_INVALID_PURPOSE", "Propósito de cuenta inválido");
+        boolean favoritePaymentAccount = request.favoritePaymentAccount() == null
+                ? Boolean.TRUE.equals(account.getEsCuentaFavoritaPagos())
+                : request.favoritePaymentAccount();
+        boolean massPaymentMainAccount = request.massPaymentMainAccount() == null
+                ? Boolean.TRUE.equals(account.getEsCuentaMatrizPagos())
+                : request.massPaymentMainAccount();
+        boolean overdraftAllowed = request.overdraftAllowed() == null
+                ? Boolean.TRUE.equals(account.getPermiteSobregiro())
+                : request.overdraftAllowed();
+        BigDecimal overdraftLimit = Boolean.FALSE.equals(request.overdraftAllowed())
+                ? ZERO
+                : request.overdraftLimit() == null
+                ? nonNegative(account.getLimiteSobregiro())
+                : money(request.overdraftLimit());
+
+        validatePaymentSettingsEligibility(
+                product,
+                customer,
+                purpose,
+                favoritePaymentAccount,
+                massPaymentMainAccount);
+        validateMassPaymentOverdraftSettings(
+                account,
+                product,
+                customer,
+                massPaymentMainAccount,
+                overdraftAllowed,
+                overdraftLimit);
+
+        if (request.favoritePaymentAccount() != null) {
+            if (request.favoritePaymentAccount()) clearFavorite(account.getUuidCliente());
+            account.setEsCuentaFavoritaPagos(request.favoritePaymentAccount());
         }
-        if (r.massPaymentMainAccount() != null) c.setEsCuentaMatrizPagos(r.massPaymentMainAccount());
-        if (r.accountPurpose() != null) c.setPropositoCuenta(PropositoCuentaEnum.valueOf(r.accountPurpose()));
-        if (r.operationalAlias() != null) c.setAliasOperativo(r.operationalAlias());
-        c.setFechaActualizacion(LocalDateTime.now());
-        return AccountMapper.toResponse(cuentaRepository.save(c));
+        if (request.massPaymentMainAccount() != null) {
+            account.setEsCuentaMatrizPagos(request.massPaymentMainAccount());
+        }
+        if (request.accountPurpose() != null) account.setPropositoCuenta(purpose);
+        if (request.operationalAlias() != null) account.setAliasOperativo(blankToNull(request.operationalAlias()));
+        if (request.overdraftAllowed() != null || request.overdraftLimit() != null) {
+            account.setPermiteSobregiro(overdraftAllowed);
+            account.setLimiteSobregiro(overdraftAllowed ? overdraftLimit : ZERO.setScale(2, RoundingMode.HALF_UP));
+        }
+        account.setFechaActualizacion(LocalDateTime.now());
+
+        Map<String, Object> detail = new LinkedHashMap<>();
+        detail.put("accountNumber", account.getNumeroCuenta());
+        detail.put("favoritePaymentAccount", account.getEsCuentaFavoritaPagos());
+        detail.put("massPaymentMainAccount", account.getEsCuentaMatrizPagos());
+        detail.put("accountPurpose", account.getPropositoCuenta().name());
+        detail.put("overdraftAllowed", account.getPermiteSobregiro());
+        detail.put("overdraftLimit", account.getLimiteSobregiro());
+        auditoriaService.registrar(
+                "UPDATE_ACCOUNT_PAYMENT_SETTINGS",
+                "CUENTA",
+                account.getUuidCuenta(),
+                ResultadoAuditoriaAccountEnum.OK,
+                toJson(detail));
+        return AccountMapper.toResponse(cuentaRepository.save(account));
     }
 
     @Transactional
@@ -264,7 +433,7 @@ public class AccountService {
         tx.setAsientoContableUuid(registerCashJournal(tx, true));
         transaccionRepository.saveAndFlush(tx);
         registerTellerCompletedEvent(tx, "TELLER_DEPOSIT_COMPLETED", "DEPOSITO", customer.getEmail());
-        return AccountMapper.toTransaction(tx);
+        return toTransactionResponse(tx);
     }
 
     @Transactional
@@ -272,6 +441,7 @@ public class AccountService {
         String subtype = defaultString(r.subtypeCode(), "RET_VENTANILLA");
         adminGrpcClient.validateTransactionSubtypeActive(subtype, TipoMovimientoCuentaEnum.DEBITO.name());
         LocalDate date = parseDate(r.accountingDate());
+        blockExpirationService.expireForAccount(r.accountNumber());
         Cuenta account = findAccount(r.accountNumber());
         CustomerBasicGrpcResponse customer = customerGrpcClient.getByUuid(account.getUuidCliente());
         TransaccionCuenta tx = applyMovement(account, TipoMovimientoCuentaEnum.DEBITO, money(r.amount()), subtype,
@@ -279,7 +449,7 @@ public class AccountService {
         tx.setAsientoContableUuid(registerCashJournal(tx, false));
         transaccionRepository.saveAndFlush(tx);
         registerTellerCompletedEvent(tx, "TELLER_WITHDRAWAL_COMPLETED", "RETIRO", customer.getEmail());
-        return AccountMapper.toTransaction(tx);
+        return toTransactionResponse(tx);
     }
 
     @Transactional(readOnly = true)
@@ -296,12 +466,14 @@ public class AccountService {
                         true,
                         account.getEstado().name(),
                         account.getNombreTitularReferencia(),
+                        maskAccountNumber(account.getNumeroCuenta()),
                         "Banco BanQuito"
                 ))
                 .orElseGet(() -> new P2PBeneficiaryValidationResponse(
                         false,
                         "NO_ENCONTRADA",
                         null,
+                        maskAccountNumber(accountNumber.trim()),
                         "Banco BanQuito"
                 ));
     }
@@ -312,12 +484,14 @@ public class AccountService {
         String corr = r.correlationId() == null || r.correlationId().isBlank()
                 ? UUID.randomUUID().toString()
                 : r.correlationId().trim();
+        blockExpirationService.expireForAccount(r.sourceAccountNumber());
         Cuenta source = findActiveAccount(r.sourceAccountNumber());
         Cuenta target = findActiveAccount(r.targetAccountNumber());
         CustomerBasicGrpcResponse sourceCustomer = customerGrpcClient.getByUuid(source.getUuidCliente());
         CustomerBasicGrpcResponse targetCustomer = customerGrpcClient.getByUuid(target.getUuidCliente());
-        TransaccionCuenta debit = applyMovement(source, TipoMovimientoCuentaEnum.DEBITO, money(r.amount()), "TRF_P2P_DEB", CanalOrigenCuentaEnum.BANCA_WEB, r.description(), date, corr, null, null);
-        TransaccionCuenta credit = applyMovement(target, TipoMovimientoCuentaEnum.CREDITO, money(r.amount()), "TRF_P2P_CRE", CanalOrigenCuentaEnum.BANCA_WEB, r.description(), date, corr, null, null);
+        String description = blankToNull(r.description());
+        TransaccionCuenta debit = applyMovement(source, TipoMovimientoCuentaEnum.DEBITO, money(r.amount()), "TRF_P2P_DEB", CanalOrigenCuentaEnum.BANCA_WEB, description, date, corr, null, null);
+        TransaccionCuenta credit = applyMovement(target, TipoMovimientoCuentaEnum.CREDITO, money(r.amount()), "TRF_P2P_CRE", CanalOrigenCuentaEnum.BANCA_WEB, description, date, corr, null, null);
         String asientoContableUuid = registerP2PJournal(debit, credit);
         debit.setAsientoContableUuid(asientoContableUuid);
         credit.setAsientoContableUuid(asientoContableUuid);
@@ -334,7 +508,7 @@ public class AccountService {
         eventPayload.put("sourceEmail", sourceCustomer.getEmail());
         eventPayload.put("targetEmail", targetCustomer.getEmail());
         eventPayload.put("amount", money(r.amount()));
-        eventPayload.put("description", r.description());
+        eventPayload.put("description", description);
         eventPayload.put("accountingDate", date.toString());
         eventPayload.put("debitTransactionUuid", debit.getUuidTransaccion());
         eventPayload.put("creditTransactionUuid", credit.getUuidTransaccion());
@@ -347,41 +521,85 @@ public class AccountService {
                 toJson(eventPayload)
         );
 
-        return List.of(AccountMapper.toTransaction(debit), AccountMapper.toTransaction(credit));
+        return toTransactionResponses(List.of(debit, credit));
     }
 
     @Transactional
-    public BlockResponse block(String accountNumber, BlockAccountRequest r) {
-        Cuenta c = findActiveAccount(accountNumber);
-        BigDecimal amount = positiveMoney(r.amount());
-        ensureAvailable(c, amount);
-        c.setMontoRetenido(c.getMontoRetenido().add(amount));
-        c.setSaldoDisponible(c.getSaldoDisponible().subtract(amount));
-        c.setFechaActualizacion(LocalDateTime.now());
-        BloqueoCuenta b = new BloqueoCuenta();
-        b.setUuidBloqueo(UUID.randomUUID().toString());
-        b.setCuenta(c);
-        b.setMontoBloqueado(amount);
-        b.setMotivo(r.reason());
-        b.setAutoridadOrdenante(r.orderingAuthority());
-        b.setEstado(EstadoBloqueoCuentaEnum.ACTIVO);
-        b.setUuidUsuarioCore(r.userCoreUuid());
-        b.setFechaBloqueo(LocalDateTime.now());
-        cuentaRepository.save(c);
-        return AccountMapper.toBlock(bloqueoRepository.save(b));
+    public BlockResponse block(String accountNumber, BlockAccountRequest request, String actorUuid) {
+        blockExpirationService.expireForAccount(accountNumber);
+        Cuenta account = findActiveAccount(accountNumber);
+        BigDecimal amount = positiveMoney(request.amount());
+        ensureAvailable(account, amount);
+        validateBlockExpiration(request.expiresAt());
+
+        account.setMontoRetenido(account.getMontoRetenido().add(amount));
+        recalculateAvailableBalance(account);
+        account.setFechaActualizacion(LocalDateTime.now());
+
+        BloqueoCuenta block = new BloqueoCuenta();
+        block.setUuidBloqueo(UUID.randomUUID().toString());
+        block.setCuenta(account);
+        block.setMontoBloqueado(amount);
+        block.setMotivo(request.reason().trim());
+        block.setAutoridadOrdenante(blankToNull(request.orderingAuthority()));
+        block.setEstado(EstadoBloqueoCuentaEnum.ACTIVO);
+        block.setUuidUsuarioCore(normalizeActor(actorUuid));
+        block.setFechaBloqueo(LocalDateTime.now());
+        block.setFechaExpiracion(request.expiresAt());
+        cuentaRepository.save(account);
+        BloqueoCuenta savedBlock = bloqueoRepository.save(block);
+
+        Map<String, Object> detail = blockEventPayload(savedBlock, "CREATED", actorUuid);
+        auditoriaService.registrar(
+                "CREATE_ACCOUNT_BLOCK",
+                "BLOQUEO_CUENTA",
+                savedBlock.getUuidBloqueo(),
+                ResultadoAuditoriaAccountEnum.OK,
+                toJson(detail));
+        outboxEventService.registrar(
+                "ACCOUNT_BLOCK_CREATED",
+                "BLOQUEO_CUENTA",
+                savedBlock.getUuidBloqueo(),
+                CorrelationIdHolder.get(),
+                toJson(detail));
+        return AccountMapper.toBlock(savedBlock);
     }
 
     @Transactional
-    public BlockResponse releaseBlock(String accountNumber, String blockUuid) {
-        Cuenta c = findAccount(accountNumber);
-        BloqueoCuenta b = bloqueoRepository.findByUuidBloqueo(blockUuid).orElseThrow(() -> notFound("ACCOUNT_BLOCK_NOT_FOUND", "Bloqueo no encontrado"));
-        if (b.getEstado() != EstadoBloqueoCuentaEnum.ACTIVO) throw new BusinessException("ACCOUNT_BLOCK_NOT_ACTIVE", "El bloqueo no está activo", HttpStatus.CONFLICT);
-        b.setEstado(EstadoBloqueoCuentaEnum.LIBERADO);
-        b.setFechaLiberacion(LocalDateTime.now());
-        c.setMontoRetenido(c.getMontoRetenido().subtract(b.getMontoBloqueado()));
-        c.setSaldoDisponible(c.getSaldoDisponible().add(b.getMontoBloqueado()));
-        cuentaRepository.save(c);
-        return AccountMapper.toBlock(bloqueoRepository.save(b));
+    public BlockResponse releaseBlock(String accountNumber, String blockUuid, String actorUuid) {
+        blockExpirationService.expireForAccount(accountNumber);
+        Cuenta account = findAccount(accountNumber);
+        BloqueoCuenta block = bloqueoRepository.findByUuidBloqueoAndCuenta(blockUuid, account)
+                .orElseThrow(() -> notFound("ACCOUNT_BLOCK_NOT_FOUND", "Bloqueo no encontrado para la cuenta indicada"));
+        if (block.getEstado() != EstadoBloqueoCuentaEnum.ACTIVO) {
+            throw new BusinessException(
+                    "ACCOUNT_BLOCK_NOT_ACTIVE",
+                    "El bloqueo no se encuentra activo",
+                    HttpStatus.CONFLICT);
+        }
+
+        block.setEstado(EstadoBloqueoCuentaEnum.LIBERADO);
+        block.setFechaLiberacion(LocalDateTime.now());
+        account.setMontoRetenido(nonNegative(account.getMontoRetenido().subtract(block.getMontoBloqueado())));
+        recalculateAvailableBalance(account);
+        account.setFechaActualizacion(LocalDateTime.now());
+        cuentaRepository.save(account);
+        BloqueoCuenta savedBlock = bloqueoRepository.save(block);
+
+        Map<String, Object> detail = blockEventPayload(savedBlock, "RELEASED", actorUuid);
+        auditoriaService.registrar(
+                "RELEASE_ACCOUNT_BLOCK",
+                "BLOQUEO_CUENTA",
+                savedBlock.getUuidBloqueo(),
+                ResultadoAuditoriaAccountEnum.OK,
+                toJson(detail));
+        outboxEventService.registrar(
+                "ACCOUNT_BLOCK_RELEASED",
+                "BLOQUEO_CUENTA",
+                savedBlock.getUuidBloqueo(),
+                CorrelationIdHolder.get(),
+                toJson(detail));
+        return AccountMapper.toBlock(savedBlock);
     }
 
     @Transactional
@@ -446,13 +664,20 @@ public class AccountService {
         outboxEventService.registrar("ACCOUNT_TRANSACTION_REVERSED", "TRANSACCION_CUENTA", txUuid,
                 "{\"originalTransactionUuid\":\"" + txUuid
                         + "\",\"reversalTransactionUuid\":\"" + reversal.getUuidTransaccion() + "\"}");
-        return AccountMapper.toTransaction(reversal);
+        return toTransactionResponse(reversal);
     }
 
     @Transactional
     public ReservationResponse createReservation(ReservationRequest r) {
         customerGrpcClient.validateMassPaymentsEnabled(r.companyCustomerUuid());
+        blockExpirationService.expireForAccount(r.mainAccountNumber());
         Cuenta main = findActiveAccount(r.mainAccountNumber());
+        if (!Boolean.TRUE.equals(main.getEsCuentaMatrizPagos())) {
+            throw new BusinessException(
+                    "ACCOUNT_MASS_PAYMENTS_ACCOUNT_NOT_ENABLED",
+                    "La cuenta no está habilitada para pagos masivos",
+                    HttpStatus.CONFLICT);
+        }
         if (!Objects.equals(main.getUuidCliente(), r.companyCustomerUuid())) throw new BusinessException("ACCOUNT_RESERVATION_CUSTOMER_MISMATCH", "La cuenta matriz no pertenece a la empresa indicada", HttpStatus.CONFLICT);
         BigDecimal totalAmount = positiveMoney(r.totalAmount());
         BigDecimal commissionAmount = money(r.commissionAmount() == null ? ZERO : r.commissionAmount());
@@ -470,6 +695,7 @@ public class AccountService {
         res.setCanalOrigen(CanalOrigenReservaEnum.valueOf(defaultString(r.channel(), "SWITCH_API")));
         res.setMontoTotalLote(totalAmount);
         res.setMontoComision(commissionAmount);
+        res.setMontoComisionCobrado(ZERO);
         res.setMontoReservado(total);
         res.setMontoConsumidoOnus(ZERO);
         res.setMontoConsumidoOffus(ZERO);
@@ -676,11 +902,9 @@ public class AccountService {
     private TransaccionCuenta applyMovement(Cuenta c, TipoMovimientoCuentaEnum type, BigDecimal amount, String subtype, CanalOrigenCuentaEnum channel, String externalRef, LocalDate date, String correlation, ReservaPagoMasivo reserva, InstruccionPagoMasivoCore instruccion) {
         amount = positiveMoney(amount);
         adminGrpcClient.validateTransactionSubtypeActive(subtype, type.name());
+        validateMovementStatus(c, type, channel, subtype);
         if (type == TipoMovimientoCuentaEnum.DEBITO) {
-            c = findActiveAccount(c.getNumeroCuenta());
             ensureAvailable(c, amount);
-        } else if (c.getEstado() != EstadoCuentaEnum.ACTIVA) {
-            throw new BusinessException("ACCOUNT_NOT_ACTIVE", "La cuenta no está activa", HttpStatus.CONFLICT);
         }
         BigDecimal previous = c.getSaldoContable();
         if (type == TipoMovimientoCuentaEnum.CREDITO) {
@@ -714,6 +938,40 @@ public class AccountService {
         TransaccionCuenta saved = transaccionRepository.saveAndFlush(t);
         outboxEventService.registrar("ACCOUNT_TRANSACTION_APPLIED", "TRANSACCION_CUENTA", saved.getUuidTransaccion(), "{\"accountNumber\":\"" + c.getNumeroCuenta() + "\"}");
         return saved;
+    }
+
+    private String registerOpeningDepositJournal(TransaccionCuenta tx) {
+        List<Map<String, Object>> lines = List.of(
+                line(null, "BOVEDA_CENTRAL", "DEBITO", tx.getMonto(), OPENING_DEPOSIT_DESCRIPTION, 1),
+                line(null, "CLIENTES_PASIVO", "CREDITO", tx.getMonto(), "Abono inicial a cuenta cliente", 2));
+        return accountingGrpcClient.createJournalEntry(
+                journal(tx, "DEPOSITO_APERTURA_CUENTA", OPENING_DEPOSIT_DESCRIPTION, lines));
+    }
+
+    private void registerOpeningDepositCompletedEvent(TransaccionCuenta tx, String customerEmail) {
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("correlationId", tx.getUuidCorrelacion());
+        payload.put("transactionUuid", tx.getUuidTransaccion());
+        payload.put("accountingEntryUuid", tx.getAsientoContableUuid());
+        payload.put("accountUuid", tx.getCuenta().getUuidCuenta());
+        payload.put("accountNumber", tx.getCuenta().getNumeroCuenta());
+        payload.put("customerUuid", tx.getCuenta().getUuidCliente());
+        payload.put("customerEmail", customerEmail);
+        payload.put("holderName", tx.getCuenta().getNombreTitularReferencia());
+        payload.put("amount", tx.getMonto());
+        payload.put("movementType", tx.getTipoMovimiento().name());
+        payload.put("operationName", "APERTURA_CUENTA");
+        payload.put("description", OPENING_DEPOSIT_DESCRIPTION);
+        payload.put("receiptNumber", tx.getNumeroComprobante());
+        payload.put("accountingDate", tx.getFechaContable().toString());
+        payload.put("resultingAccountingBalance", tx.getSaldoContableResultante());
+        payload.put("resultingAvailableBalance", tx.getSaldoDisponibleResultante());
+        outboxEventService.registrar(
+                "ACCOUNT_OPENING_FUNDED",
+                "TRANSACCION_CUENTA",
+                tx.getUuidTransaccion(),
+                tx.getUuidCorrelacion(),
+                toJson(payload));
     }
 
     private String registerCashJournal(TransaccionCuenta tx, boolean deposit) {
@@ -852,6 +1110,126 @@ public class AccountService {
                                                    CustomerBasicGrpcResponse customer,
                                                    PropositoCuentaEnum purpose,
                                                    CreateAccountRequest request) {
+        validatePaymentSettingsEligibility(
+                product,
+                customer,
+                purpose,
+                Boolean.TRUE.equals(request.favoritePaymentAccount()),
+                Boolean.TRUE.equals(request.massPaymentMainAccount()));
+    }
+
+    private void validateMovementStatus(Cuenta account,
+                                        TipoMovimientoCuentaEnum movementType,
+                                        CanalOrigenCuentaEnum channel,
+                                        String subtype) {
+        EstadoCuentaEnum status = account.getEstado();
+        if (movementType == TipoMovimientoCuentaEnum.DEBITO) {
+            if (status != EstadoCuentaEnum.ACTIVA) {
+                throw new BusinessException(
+                        "ACCOUNT_NOT_ACTIVE",
+                        "La cuenta debe estar activa para realizar movimientos de salida",
+                        HttpStatus.CONFLICT);
+            }
+            return;
+        }
+
+        boolean cashDeposit = channel == CanalOrigenCuentaEnum.VENTANILLA
+                && "DEP_VENTANILLA".equals(subtype);
+        if (cashDeposit && EnumSet.of(
+                EstadoCuentaEnum.ACTIVA,
+                EstadoCuentaEnum.INACTIVA,
+                EstadoCuentaEnum.BLOQUEADA).contains(status)) {
+            return;
+        }
+        if (status == EstadoCuentaEnum.ACTIVA) return;
+
+        String code = status == EstadoCuentaEnum.SUSPENDIDA
+                ? "ACCOUNT_SUSPENDED"
+                : status == EstadoCuentaEnum.CERRADA
+                ? "ACCOUNT_CLOSED"
+                : "ACCOUNT_CREDIT_NOT_ALLOWED_BY_STATUS";
+        String message = status == EstadoCuentaEnum.SUSPENDIDA
+                ? "La cuenta suspendida no admite movimientos"
+                : status == EstadoCuentaEnum.CERRADA
+                ? "La cuenta cerrada no admite movimientos"
+                : "La cuenta debe estar activa para recibir este tipo de crédito";
+        throw new BusinessException(code, message, HttpStatus.CONFLICT);
+    }
+
+    private void validateMassPaymentOverdraftSettings(Cuenta account,
+                                                       AccountSubtypeResponse product,
+                                                       CustomerBasicGrpcResponse customer,
+                                                       boolean massPaymentMainAccount,
+                                                       boolean overdraftAllowed,
+                                                       BigDecimal overdraftLimit) {
+        BigDecimal normalizedLimit = nonNegative(overdraftLimit);
+        BigDecimal currentExposure = account.getSaldoDisponible().min(account.getSaldoContable()).min(ZERO).abs();
+
+        if (!overdraftAllowed) {
+            if (normalizedLimit.compareTo(ZERO) != 0) {
+                throw new BusinessException(
+                        "ACCOUNT_OVERDRAFT_LIMIT_REQUIRES_ENABLEMENT",
+                        "El límite de sobregiro debe ser cero cuando el sobregiro está deshabilitado",
+                        HttpStatus.BAD_REQUEST);
+            }
+            if (currentExposure.compareTo(ZERO) > 0) {
+                throw new BusinessException(
+                        "ACCOUNT_OVERDRAFT_IN_USE",
+                        "No puede deshabilitarse el sobregiro mientras la cuenta mantiene un saldo negativo",
+                        HttpStatus.CONFLICT);
+            }
+            return;
+        }
+
+        if (account.getEstado() != EstadoCuentaEnum.ACTIVA) {
+            throw new BusinessException(
+                    "ACCOUNT_OVERDRAFT_REQUIRES_ACTIVE_ACCOUNT",
+                    "El sobregiro para comisión solo puede configurarse en una cuenta activa",
+                    HttpStatus.CONFLICT);
+        }
+        if (!massPaymentMainAccount) {
+            throw new BusinessException(
+                    "ACCOUNT_OVERDRAFT_REQUIRES_MASS_PAYMENT_MAIN",
+                    "El sobregiro para comisión requiere que la cuenta sea matriz de pagos masivos",
+                    HttpStatus.CONFLICT);
+        }
+        if (!"JURIDICO".equalsIgnoreCase(customer.getCustomerType())) {
+            throw new BusinessException(
+                    "ACCOUNT_OVERDRAFT_ONLY_LEGAL_CUSTOMER",
+                    "El sobregiro para comisión solo aplica a cuentas empresariales",
+                    HttpStatus.CONFLICT);
+        }
+        if (!"CORRIENTE".equalsIgnoreCase(product.getBaseType())) {
+            throw new BusinessException(
+                    "ACCOUNT_OVERDRAFT_ONLY_CHECKING",
+                    "El sobregiro para comisión solo puede habilitarse en cuentas corrientes",
+                    HttpStatus.CONFLICT);
+        }
+        if (!product.getSupportsMassPayments()) {
+            throw new BusinessException(
+                    "ACCOUNT_PRODUCT_MASS_PAYMENTS_NOT_SUPPORTED",
+                    "El producto no admite pagos masivos",
+                    HttpStatus.CONFLICT);
+        }
+        if (normalizedLimit.compareTo(ZERO) <= 0) {
+            throw new BusinessException(
+                    "ACCOUNT_OVERDRAFT_LIMIT_REQUIRED",
+                    "El límite autorizado debe ser mayor a cero",
+                    HttpStatus.BAD_REQUEST);
+        }
+        if (currentExposure.compareTo(normalizedLimit) > 0) {
+            throw new BusinessException(
+                    "ACCOUNT_OVERDRAFT_LIMIT_BELOW_EXPOSURE",
+                    "El límite no puede ser menor al sobregiro actualmente utilizado",
+                    HttpStatus.CONFLICT);
+        }
+    }
+
+    private void validatePaymentSettingsEligibility(AccountSubtypeResponse product,
+                                                    CustomerBasicGrpcResponse customer,
+                                                    PropositoCuentaEnum purpose,
+                                                    boolean favoritePaymentAccount,
+                                                    boolean massPaymentMainAccount) {
         if (!product.getAllowedCustomerTypesList().isEmpty()
                 && !product.getAllowedCustomerTypesList().contains(customer.getCustomerType())) {
             throw new BusinessException("ACCOUNT_PRODUCT_CUSTOMER_TYPE_NOT_ALLOWED",
@@ -862,15 +1240,127 @@ public class AccountService {
             throw new BusinessException("ACCOUNT_PRODUCT_PURPOSE_NOT_ALLOWED",
                     "El producto no admite el propósito de cuenta solicitado", HttpStatus.CONFLICT);
         }
-        if (Boolean.TRUE.equals(request.massPaymentMainAccount()) && !product.getSupportsMassPayments()) {
-            throw new BusinessException("ACCOUNT_PRODUCT_MASS_PAYMENTS_NOT_SUPPORTED",
-                    "El producto no admite pagos masivos", HttpStatus.CONFLICT);
-        }
-        if (Boolean.TRUE.equals(request.favoritePaymentAccount())
-                && !product.getSupportsFavoritePaymentAccount()) {
+        if (favoritePaymentAccount && !product.getSupportsFavoritePaymentAccount()) {
             throw new BusinessException("ACCOUNT_PRODUCT_FAVORITE_NOT_SUPPORTED",
                     "El producto no puede utilizarse como cuenta favorita de pagos", HttpStatus.CONFLICT);
         }
+        if (!massPaymentMainAccount) return;
+        if (!"JURIDICO".equalsIgnoreCase(customer.getCustomerType())) {
+            throw new BusinessException("ACCOUNT_MASS_PAYMENT_MAIN_ONLY_LEGAL",
+                    "Solo una cuenta de persona jurídica puede habilitarse para pagos masivos", HttpStatus.CONFLICT);
+        }
+        if (!customer.getMassPaymentsEnabled()) {
+            throw new BusinessException("ACCOUNT_MASS_PAYMENTS_DISABLED",
+                    "La empresa no tiene habilitado el servicio de pagos masivos", HttpStatus.CONFLICT);
+        }
+        if (!product.getSupportsMassPayments()) {
+            throw new BusinessException("ACCOUNT_PRODUCT_MASS_PAYMENTS_NOT_SUPPORTED",
+                    "El producto no admite pagos masivos", HttpStatus.CONFLICT);
+        }
+    }
+
+    private void validateStatusTransition(EstadoCuentaEnum current, EstadoCuentaEnum next) {
+        if (current == EstadoCuentaEnum.CERRADA) {
+            throw new BusinessException(
+                    "ACCOUNT_STATUS_TRANSITION_NOT_ALLOWED",
+                    "Una cuenta cerrada no admite cambios de estado",
+                    HttpStatus.CONFLICT);
+        }
+        Set<EstadoCuentaEnum> allowed = switch (current) {
+            case ACTIVA -> EnumSet.of(EstadoCuentaEnum.INACTIVA, EstadoCuentaEnum.BLOQUEADA, EstadoCuentaEnum.SUSPENDIDA);
+            case INACTIVA -> EnumSet.of(EstadoCuentaEnum.ACTIVA, EstadoCuentaEnum.BLOQUEADA, EstadoCuentaEnum.SUSPENDIDA);
+            case BLOQUEADA -> EnumSet.of(EstadoCuentaEnum.ACTIVA, EstadoCuentaEnum.INACTIVA, EstadoCuentaEnum.SUSPENDIDA);
+            case SUSPENDIDA -> EnumSet.of(EstadoCuentaEnum.ACTIVA, EstadoCuentaEnum.INACTIVA, EstadoCuentaEnum.BLOQUEADA);
+            case CERRADA -> EnumSet.noneOf(EstadoCuentaEnum.class);
+        };
+        if (!allowed.contains(next)) {
+            throw new BusinessException(
+                    "ACCOUNT_STATUS_TRANSITION_NOT_ALLOWED",
+                    "La transición de estado solicitada no está permitida",
+                    HttpStatus.CONFLICT);
+        }
+    }
+
+    private void validateBlockExpiration(LocalDateTime expiration) {
+        if (expiration != null && !expiration.isAfter(LocalDateTime.now())) {
+            throw new BusinessException(
+                    "ACCOUNT_BLOCK_EXPIRATION_INVALID",
+                    "La fecha de expiración debe ser posterior al momento actual",
+                    HttpStatus.BAD_REQUEST);
+        }
+    }
+
+    private Map<String, Object> blockEventPayload(BloqueoCuenta block, String action, String actorUuid) {
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("action", action);
+        payload.put("blockUuid", block.getUuidBloqueo());
+        payload.put("accountNumber", block.getCuenta().getNumeroCuenta());
+        payload.put("amount", block.getMontoBloqueado());
+        payload.put("status", block.getEstado().name());
+        payload.put("reason", block.getMotivo());
+        payload.put("orderingAuthority", block.getAutoridadOrdenante());
+        payload.put("actorUuid", actorUuid == null ? "SYSTEM" : normalizeActor(actorUuid));
+        payload.put("blockedAt", block.getFechaBloqueo());
+        payload.put("expiresAt", block.getFechaExpiracion());
+        payload.put("releasedAt", block.getFechaLiberacion());
+        return payload;
+    }
+
+    private void recalculateAvailableBalance(Cuenta account) {
+        BigDecimal accountingBalance = (account.getSaldoContable() == null ? ZERO : account.getSaldoContable())
+                .setScale(2, RoundingMode.HALF_UP);
+        BigDecimal withheldAmount = nonNegative(account.getMontoRetenido());
+        BigDecimal availableBalance = accountingBalance.subtract(withheldAmount);
+        BigDecimal minimumAllowed = Boolean.TRUE.equals(account.getPermiteSobregiro())
+                ? account.getLimiteSobregiro().negate()
+                : ZERO;
+        if (availableBalance.compareTo(minimumAllowed) < 0) {
+            throw new BusinessException(
+                    "ACCOUNT_BALANCE_INVARIANT_VIOLATION",
+                    "El saldo disponible no puede ser inferior al límite permitido",
+                    HttpStatus.CONFLICT);
+        }
+        account.setSaldoDisponible(availableBalance.setScale(2, RoundingMode.HALF_UP));
+    }
+
+    private BigDecimal nonNegative(BigDecimal value) {
+        if (value == null || value.compareTo(ZERO) < 0) return ZERO.setScale(2, RoundingMode.HALF_UP);
+        return value.setScale(2, RoundingMode.HALF_UP);
+    }
+
+    private String normalizeActor(String actorUuid) {
+        if (actorUuid == null || actorUuid.isBlank()) {
+            throw new BusinessException(
+                    "ACCOUNT_AUTHENTICATED_ACTOR_REQUIRED",
+                    "No fue posible identificar al actor autenticado",
+                    HttpStatus.UNAUTHORIZED);
+        }
+        return actorUuid.trim();
+    }
+
+    private AccountTransactionResponse toTransactionResponse(TransaccionCuenta transaction) {
+        return AccountMapper.toTransaction(
+                transaction,
+                adminGrpcClient.getTransactionSubtypeName(transaction.getCodigoSubtipoTransaccion()));
+    }
+
+    private List<AccountTransactionResponse> toTransactionResponses(List<TransaccionCuenta> transactions) {
+        Map<String, String> subtypeNames = new HashMap<>();
+        return transactions.stream()
+                .map(transaction -> AccountMapper.toTransaction(
+                        transaction,
+                        subtypeNames.computeIfAbsent(
+                                transaction.getCodigoSubtipoTransaccion(),
+                                adminGrpcClient::getTransactionSubtypeName)))
+                .toList();
+    }
+
+    private String maskAccountNumber(String accountNumber) {
+        if (accountNumber == null || accountNumber.isBlank()) return null;
+        String normalized = accountNumber.trim();
+        int visibleDigits = Math.min(4, normalized.length());
+        return "•".repeat(normalized.length() - visibleDigits)
+                + normalized.substring(normalized.length() - visibleDigits);
     }
 
     private Cuenta findAccount(String number) { return cuentaRepository.findByNumeroCuenta(number).orElseThrow(() -> notFound("ACCOUNT_NOT_FOUND", "Cuenta no encontrada")); }
@@ -892,7 +1382,17 @@ public class AccountService {
         }
         return normalized;
     }
-    private LocalDate parseDate(String v) { return v == null || v.isBlank() ? accountingGrpcClient.getCurrentAccountingDate() : LocalDate.parse(v); }
+    private LocalDate parseDate(String value) {
+        if (value == null || value.isBlank()) return accountingGrpcClient.resolveOperationAccountingDate();
+        try {
+            return LocalDate.parse(value.trim());
+        } catch (RuntimeException exception) {
+            throw new BusinessException(
+                    "ACCOUNT_INVALID_ACCOUNTING_DATE",
+                    "La fecha contable debe usar el formato yyyy-MM-dd",
+                    HttpStatus.BAD_REQUEST);
+        }
+    }
     private void clearFavorite(String customerUuid) { cuentaRepository.findByUuidClienteAndEsCuentaFavoritaPagos(customerUuid, true).ifPresent(c -> { c.setEsCuentaFavoritaPagos(false); cuentaRepository.save(c); }); }
 
     private String toJson(Map<String, Object> payload) {

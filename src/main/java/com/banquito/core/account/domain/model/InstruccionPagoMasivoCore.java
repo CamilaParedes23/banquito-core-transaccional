@@ -58,6 +58,12 @@ public class InstruccionPagoMasivoCore {
     private EstadoInstruccionPagoMasivoEnum estado;
     @Column(name = "MOTIVO_RECHAZO", length = 300)
     private String motivoRechazo;
+    @Column(name = "UUID_TRANSACCION_CORE", length = 36)
+    private String uuidTransaccionCore;
+    @Column(name = "ASIENTO_CONTABLE_UUID", length = 36)
+    private String asientoContableUuid;
+    @Column(name = "NUMERO_COMPROBANTE", length = 80)
+    private String numeroComprobante;
     @Column(name = "FECHA_CONTABLE", nullable = false)
     private LocalDate fechaContable;
     @Column(name = "FECHA_CREACION", nullable = false)

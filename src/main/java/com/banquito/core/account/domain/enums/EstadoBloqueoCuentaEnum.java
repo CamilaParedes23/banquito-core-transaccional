@@ -6,7 +6,8 @@ import lombok.Getter;
 public enum EstadoBloqueoCuentaEnum {
     ACTIVO("ACTIVO"),
     LIBERADO("LIBERADO"),
-    REVOCADO("REVOCADO");
+    REVOCADO("REVOCADO"),
+    EXPIRADO("EXPIRADO");
 
     private final String value;
 

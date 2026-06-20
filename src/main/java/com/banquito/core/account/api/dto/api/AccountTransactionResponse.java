@@ -8,6 +8,7 @@ public record AccountTransactionResponse(
         String transactionUuid,
         String accountNumber,
         String subtypeCode,
+        String subtypeName,
         String movementType,
         BigDecimal amount,
         BigDecimal resultingAccountingBalance,

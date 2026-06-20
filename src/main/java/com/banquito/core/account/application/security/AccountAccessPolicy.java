@@ -24,6 +24,10 @@ public class AccountAccessPolicy {
     private static final String SCOPE_RESERVE_CREATE = "core.reserve.create";
     private static final String SCOPE_RESERVE_CONSUME = "core.reserve.consume";
     private static final String SCOPE_RESERVE_RELEASE = "core.reserve.release";
+    private static final String SCOPE_RESERVE_READ = "core.reserve.read";
+    private static final String SCOPE_RESERVE_FEE = "core.reserve.fee";
+    private static final String SCOPE_RESERVE_CLOSE = "core.reserve.close";
+    private static final String SCOPE_RESERVE_REVERSE = "core.reserve.reverse";
 
     private final CuentaRepository cuentaRepository;
     private final ReservaPagoMasivoRepository reservaRepository;
@@ -100,11 +104,32 @@ public class AccountAccessPolicy {
         return canAccessReservation(authentication, reservationUuid, SCOPE_RESERVE_RELEASE);
     }
 
+    /**
+     * Contrato heredado conservado para compatibilidad con reglas SpEL previas.
+     * Las operaciones nuevas usan scopes específicos de mínimo privilegio.
+     */
     public boolean canManageReservation(Authentication authentication, String reservationUuid) {
         AuthenticatedActor actor = actor(authentication);
         if (actor == null || isBlank(reservationUuid)) return false;
         if (canBackoffice(authentication)) return true;
-        return hasRole(actor, ROLE_SERVICE) && (hasScope(actor, SCOPE_RESERVE_CONSUME) || hasScope(actor, SCOPE_RESERVE_RELEASE));
+        return hasRole(actor, ROLE_SERVICE)
+                && (hasScope(actor, SCOPE_RESERVE_CONSUME) || hasScope(actor, SCOPE_RESERVE_RELEASE));
+    }
+
+    public boolean canReadReservation(Authentication authentication, String reservationUuid) {
+        return canAccessReservation(authentication, reservationUuid, SCOPE_RESERVE_READ);
+    }
+
+    public boolean canChargeReservationFee(Authentication authentication, String reservationUuid) {
+        return canAccessReservation(authentication, reservationUuid, SCOPE_RESERVE_FEE);
+    }
+
+    public boolean canCloseReservation(Authentication authentication, String reservationUuid) {
+        return canAccessReservation(authentication, reservationUuid, SCOPE_RESERVE_CLOSE);
+    }
+
+    public boolean canReverseReservation(Authentication authentication, String reservationUuid) {
+        return canAccessReservation(authentication, reservationUuid, SCOPE_RESERVE_REVERSE);
     }
 
     private boolean canAccessReservation(Authentication authentication, String reservationUuid, String requiredScope) {
