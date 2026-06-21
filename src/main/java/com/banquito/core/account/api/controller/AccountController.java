@@ -174,6 +174,13 @@ public class AccountController {
                                               @Valid @RequestBody ReverseTransactionRequest request) {
         return service.reverseTransaction(transactionUuid, request);
     }
+    @PostMapping("/switch-core/company-account-validation")
+    @PreAuthorize("@accountAccessPolicy.canCreateReservation(authentication, #p0.companyCustomerUuid(), #p0.mainAccountNumber())")
+    public CompanyAccountValidationResponse validateCompanyAccount(
+            @Valid @RequestBody CompanyAccountValidationRequest request) {
+        return massPaymentService.validateCompanyAccount(request);
+    }
+
     @PostMapping("/switch-core/payment-reservations")
     @PreAuthorize("@accountAccessPolicy.canCreateReservation(authentication, #p0.companyCustomerUuid(), #p0.mainAccountNumber())")
     public ResponseEntity<ReservationResponse> createReservation(@Valid @RequestBody ReservationRequest request) {

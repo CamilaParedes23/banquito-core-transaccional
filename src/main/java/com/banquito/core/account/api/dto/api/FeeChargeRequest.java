@@ -9,6 +9,7 @@ import java.math.BigDecimal;
 
 public record FeeChargeRequest(
         @DecimalMin(value = "0.00") @Digits(integer = 17, fraction = 2) BigDecimal amount,
+        @DecimalMin(value = "0.00") @Digits(integer = 17, fraction = 2) BigDecimal commissionSubtotal,
         @Pattern(regexp = "^$|^\\d{4}-\\d{2}-\\d{2}$", message = "accountingDate debe usar formato yyyy-MM-dd")
         String accountingDate,
         @Pattern(regexp = "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$",

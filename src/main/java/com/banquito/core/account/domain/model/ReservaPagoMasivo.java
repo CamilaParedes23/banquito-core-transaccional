@@ -42,6 +42,14 @@ public class ReservaPagoMasivo {
     private BigDecimal montoComision;
     @Column(name = "MONTO_COMISION_COBRADO", precision = 19, scale = 2, nullable = false)
     private BigDecimal montoComisionCobrado;
+    @Column(name = "MONTO_COMISION_IVA_COBRADO", precision = 19, scale = 2, nullable = false)
+    private BigDecimal montoComisionIvaCobrado;
+    @Column(name = "MONTO_COMISION_TOTAL_COBRADO", precision = 19, scale = 2, nullable = false)
+    private BigDecimal montoComisionTotalCobrado;
+    @Column(name = "UUID_TRANSACCION_COMISION", length = 36)
+    private String uuidTransaccionComision;
+    @Column(name = "ASIENTO_COMISION_UUID", length = 36)
+    private String asientoComisionUuid;
     @Column(name = "COMISION_LIQUIDADA", nullable = false)
     private Boolean comisionLiquidada;
     @Column(name = "MONTO_RESERVADO", precision = 19, scale = 2, nullable = false)

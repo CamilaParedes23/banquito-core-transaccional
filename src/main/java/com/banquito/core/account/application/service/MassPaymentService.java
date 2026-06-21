@@ -1,5 +1,7 @@
 package com.banquito.core.account.application.service;
 
+import com.banquito.core.account.api.dto.api.CompanyAccountValidationRequest;
+import com.banquito.core.account.api.dto.api.CompanyAccountValidationResponse;
 import com.banquito.core.account.api.dto.api.ConsumeReservationRequest;
 import com.banquito.core.account.api.dto.api.FeeChargeRequest;
 import com.banquito.core.account.api.dto.api.MassPaymentInstructionResponse;
@@ -55,6 +57,12 @@ public class MassPaymentService {
     private static final BigDecimal ZERO = BigDecimal.ZERO.setScale(2, RoundingMode.HALF_UP);
     private static final BigDecimal ONE_HUNDRED = new BigDecimal("100.00");
 
+    private record FeeBreakdown(
+            BigDecimal subtotal,
+            BigDecimal taxAmount,
+            BigDecimal totalChargedAmount,
+            boolean explicitSubtotalMode) {}
+
     private final CuentaRepository cuentaRepository;
     private final TransaccionCuentaRepository transaccionRepository;
     private final ReservaPagoMasivoRepository reservaRepository;
@@ -99,7 +107,7 @@ public class MassPaymentService {
         String batchId = normalizeRequired(request.batchId(), "ACCOUNT_BATCH_ID_REQUIRED", "El identificador del lote es obligatorio");
         String correlationId = normalizeRequired(request.correlationId(), "ACCOUNT_CORRELATION_ID_REQUIRED", "El UUID de correlación es obligatorio");
         BigDecimal totalAmount = positiveMoney(request.totalAmount());
-        BigDecimal commissionAmount = money(request.commissionAmount() == null ? ZERO : request.commissionAmount());
+        BigDecimal commissionAmount = resolveReservationCommissionSubtotal(request);
         CanalOrigenReservaEnum channel = parseChannel(request.channel());
 
         Optional<ReservaPagoMasivo> existingByBatch = reservaRepository.findByBatchIdExterno(batchId);
@@ -144,6 +152,10 @@ public class MassPaymentService {
         reservation.setMontoTotalLote(totalAmount);
         reservation.setMontoComision(commissionAmount);
         reservation.setMontoComisionCobrado(ZERO);
+        reservation.setMontoComisionIvaCobrado(ZERO);
+        reservation.setMontoComisionTotalCobrado(ZERO);
+        reservation.setUuidTransaccionComision(null);
+        reservation.setAsientoComisionUuid(null);
         reservation.setComisionLiquidada(commissionAmount.compareTo(ZERO) == 0);
         reservation.setMontoReservado(reservedAmount);
         reservation.setMontoConsumidoOnus(ZERO);
@@ -218,6 +230,54 @@ public class MassPaymentService {
     @Transactional(readOnly = true)
     public ReservationResponse getReservation(String reservationUuid) {
         return AccountMapper.toReservation(findReservation(reservationUuid));
+    }
+
+    @Transactional(readOnly = true)
+    public CompanyAccountValidationResponse validateCompanyAccount(CompanyAccountValidationRequest request) {
+        String companyCustomerUuid = normalizeRequired(
+                request.companyCustomerUuid(),
+                "ACCOUNT_COMPANY_CUSTOMER_UUID_REQUIRED",
+                "El UUID de la empresa es obligatorio");
+        String mainAccountNumber = normalizeRequired(
+                request.mainAccountNumber(),
+                "ACCOUNT_MAIN_ACCOUNT_REQUIRED",
+                "La cuenta matriz es obligatoria");
+        BigDecimal requestedAmount = request.amount() == null ? null : positiveMoney(request.amount());
+
+        customerGrpcClient.validateMassPaymentsEnabled(companyCustomerUuid);
+        Cuenta account = cuentaRepository.findByNumeroCuenta(mainAccountNumber)
+                .orElseThrow(() -> notFound("ACCOUNT_NOT_FOUND", "Cuenta matriz no encontrada"));
+        validateMainAccount(account, companyCustomerUuid);
+        boolean amountCovered = requestedAmount == null || account.getSaldoDisponible().compareTo(requestedAmount) >= 0;
+        if (requestedAmount != null && !amountCovered) {
+            throw new BusinessException(
+                    "ACCOUNT_INSUFFICIENT_FUNDS",
+                    "Saldo disponible insuficiente para reservar el monto solicitado",
+                    HttpStatus.CONFLICT);
+        }
+
+        BigDecimal overdraftLimit = Boolean.TRUE.equals(account.getPermiteSobregiro())
+                ? nonNullMoney(account.getLimiteSobregiro())
+                : ZERO;
+        BigDecimal overdraftUsed = account.getSaldoDisponible().min(ZERO).abs();
+        BigDecimal overdraftAvailable = overdraftLimit.subtract(overdraftUsed).max(ZERO);
+        return new CompanyAccountValidationResponse(
+                true,
+                "ACCOUNT_COMPANY_ACCOUNT_VALID",
+                "Empresa y cuenta matriz habilitadas para pagos masivos",
+                companyCustomerUuid,
+                account.getNumeroCuenta(),
+                account.getUuidCuenta(),
+                account.getEstado().name(),
+                account.getPropositoCuenta().name(),
+                Boolean.TRUE.equals(account.getEsCuentaMatrizPagos()),
+                account.getSaldoContable(),
+                account.getSaldoDisponible(),
+                requestedAmount,
+                amountCovered,
+                Boolean.TRUE.equals(account.getPermiteSobregiro()),
+                overdraftLimit,
+                overdraftAvailable);
     }
 
     @Transactional(readOnly = true)
@@ -390,10 +450,17 @@ public class MassPaymentService {
                     HttpStatus.CONFLICT);
         }
 
-        BigDecimal amount = money(request.amount() == null ? reservation.getMontoComision() : request.amount());
-        BigDecimal alreadyCharged = nonNullMoney(reservation.getMontoComisionCobrado());
+        BigDecimal ivaRate = adminGrpcClient.getIvaRate();
+        FeeBreakdown fee = resolveFeeBreakdown(request, reservation, ivaRate);
         if (Boolean.TRUE.equals(reservation.getComisionLiquidada())) {
-            if (alreadyCharged.compareTo(amount) == 0) {
+            BigDecimal alreadyChargedSubtotal = nonNullMoney(reservation.getMontoComisionCobrado());
+            BigDecimal alreadyChargedTotal = nonNullMoney(reservation.getMontoComisionTotalCobrado()).signum() > 0
+                    ? nonNullMoney(reservation.getMontoComisionTotalCobrado())
+                    : alreadyChargedSubtotal;
+            boolean replay = fee.explicitSubtotalMode()
+                    ? alreadyChargedSubtotal.compareTo(fee.subtotal()) == 0
+                    : alreadyChargedTotal.compareTo(fee.totalChargedAmount()) == 0;
+            if (replay) {
                 return new MassPaymentOperationResult<>(AccountMapper.toReservation(reservation), true);
             }
             throw new BusinessException(
@@ -402,28 +469,29 @@ public class MassPaymentService {
                     HttpStatus.CONFLICT);
         }
         validateConsumableReservation(reservation);
-        if (amount.compareTo(reservation.getMontoComision()) > 0) {
+        BigDecimal comparableFee = fee.explicitSubtotalMode() ? fee.subtotal() : fee.totalChargedAmount();
+        if (comparableFee.compareTo(reservation.getMontoComision()) > 0) {
             throw new BusinessException(
                     "ACCOUNT_RESERVATION_FEE_EXCEEDS_QUOTE",
-                    "La comisión final no puede superar el valor máximo informado al crear la reserva",
+                    fee.explicitSubtotalMode()
+                            ? "La comisión final no puede superar el subtotal máximo informado al crear la reserva"
+                            : "La comisión final no puede superar el valor máximo informado al crear la reserva",
                     HttpStatus.CONFLICT);
         }
 
         String correlationId = reservation.getUuidCorrelacion();
         String journalUuid = null;
         TransaccionCuenta feeTransaction = null;
-        BigDecimal netAmount = ZERO;
-        BigDecimal ivaAmount = ZERO;
 
-        if (amount.compareTo(ZERO) > 0) {
+        if (fee.totalChargedAmount().compareTo(ZERO) > 0) {
             Cuenta mainAccount = findAccountByIdForUpdate(reservation.getCuentaMatriz().getId());
             validateMainAccount(mainAccount, reservation.getUuidClienteEmpresa());
-            validateMassPaymentFeeOverdraftEligibility(mainAccount, amount);
+            validateMassPaymentFeeOverdraftEligibility(mainAccount, fee.totalChargedAmount());
 
             feeTransaction = applyMovement(
                     mainAccount,
                     TipoMovimientoCuentaEnum.DEBITO,
-                    amount,
+                    fee.totalChargedAmount(),
                     "COMISION_PM",
                     blankToNull(request.externalReference()),
                     accountingDate,
@@ -434,11 +502,6 @@ public class MassPaymentService {
                     true,
                     true);
 
-            BigDecimal ivaRate = adminGrpcClient.getIvaRate();
-            BigDecimal divisor = ONE_HUNDRED.add(ivaRate)
-                    .divide(ONE_HUNDRED, 6, RoundingMode.HALF_UP);
-            netAmount = amount.divide(divisor, 2, RoundingMode.HALF_UP);
-            ivaAmount = amount.subtract(netAmount).setScale(2, RoundingMode.HALF_UP);
             journalUuid = accountingGrpcClient.createJournalEntry(journal(
                     correlationId,
                     feeTransaction.getUuidTransaccion(),
@@ -447,14 +510,18 @@ public class MassPaymentService {
                     accountingDate,
                     blankToNull(request.externalReference()),
                     List.of(
-                            line("CLIENTES_PASIVO", "DEBITO", amount, "Débito de comisión a cuenta matriz", 1),
-                            line("INGRESOS_SERVICIOS_MASIVOS", "CREDITO", netAmount, "Ingreso neto por servicio", 2),
-                            line("IVA_RETENIDO", "CREDITO", ivaAmount, "IVA retenido", 3))));
+                            line("CLIENTES_PASIVO", "DEBITO", fee.totalChargedAmount(), "Débito de comisión e IVA a cuenta matriz", 1),
+                            line("INGRESOS_SERVICIOS_MASIVOS", "CREDITO", fee.subtotal(), "Ingreso neto por servicio", 2),
+                            line("IVA_RETENIDO", "CREDITO", fee.taxAmount(), "IVA generado", 3))));
             markAccountingSucceeded(feeTransaction, journalUuid);
             transaccionRepository.saveAndFlush(feeTransaction);
         }
 
-        reservation.setMontoComisionCobrado(amount);
+        reservation.setMontoComisionCobrado(fee.subtotal());
+        reservation.setMontoComisionIvaCobrado(fee.taxAmount());
+        reservation.setMontoComisionTotalCobrado(fee.totalChargedAmount());
+        reservation.setUuidTransaccionComision(feeTransaction == null ? null : feeTransaction.getUuidTransaccion());
+        reservation.setAsientoComisionUuid(journalUuid);
         reservation.setComisionLiquidada(true);
         updateReservationState(reservation);
         reservationRepositorySave(reservation);
@@ -463,14 +530,15 @@ public class MassPaymentService {
                 null,
                 feeTransaction,
                 TipoMovimientoReservaEnum.COMISION,
-                amount,
+                fee.totalChargedAmount(),
                 accountingDate);
         movement.setAsientoContableUuid(journalUuid);
         movimientoRepository.saveAndFlush(movement);
 
         Map<String, Object> payload = reservationPayload(reservation);
-        payload.put("netCommission", netAmount);
-        payload.put("ivaAmount", ivaAmount);
+        payload.put("commissionSubtotal", fee.subtotal());
+        payload.put("taxAmount", fee.taxAmount());
+        payload.put("totalChargedAmount", fee.totalChargedAmount());
         payload.put("journalEntryUuid", journalUuid);
         payload.put("transactionUuid", feeTransaction == null ? null : feeTransaction.getUuidTransaccion());
         auditoriaService.registrar(
@@ -577,7 +645,10 @@ public class MassPaymentService {
         }
         BigDecimal remaining = remainingReservationAmount(reservation);
         if (remaining.compareTo(ZERO) > 0) {
-            return releaseReservation(reservationUuid);
+            throw new BusinessException(
+                    "ACCOUNT_RESERVATION_REMAINING_AMOUNT_PENDING",
+                    "La reserva mantiene remanente pendiente; use release solo para escenarios aprobados o defina liquidación Off-Us",
+                    HttpStatus.CONFLICT);
         }
         reservation.setEstado(EstadoReservaPagoMasivoEnum.CONSUMIDA_TOTAL);
         reservation.setFechaCierre(LocalDateTime.now());
@@ -793,6 +864,71 @@ public class MassPaymentService {
                 toJson(payload));
     }
 
+
+    private BigDecimal resolveReservationCommissionSubtotal(ReservationRequest request) {
+        BigDecimal legacyAmount = request.commissionAmount();
+        BigDecimal explicitSubtotal = request.commissionSubtotal();
+        return resolveCompatibleMoney(
+                legacyAmount,
+                explicitSubtotal,
+                ZERO,
+                "ACCOUNT_RESERVATION_COMMISSION_CONFLICT",
+                "commissionAmount y commissionSubtotal no pueden tener valores diferentes");
+    }
+
+    private FeeBreakdown resolveFeeBreakdown(FeeChargeRequest request,
+                                             ReservaPagoMasivo reservation,
+                                             BigDecimal ivaRate) {
+        BigDecimal legacyTotal = request.amount() == null ? null : money(request.amount());
+        BigDecimal explicitSubtotal = request.commissionSubtotal() == null ? null : money(request.commissionSubtotal());
+        if (legacyTotal != null && explicitSubtotal != null) {
+            BigDecimal expectedTotal = addTax(explicitSubtotal, ivaRate);
+            if (legacyTotal.compareTo(expectedTotal) != 0) {
+                throw new BusinessException(
+                        "ACCOUNT_RESERVATION_FEE_AMOUNT_CONFLICT",
+                        "amount debe coincidir con commissionSubtotal + IVA, o debe enviarse solo commissionSubtotal",
+                        HttpStatus.BAD_REQUEST);
+            }
+        }
+        if (explicitSubtotal != null) {
+            BigDecimal tax = explicitSubtotal.multiply(ivaRate)
+                    .divide(ONE_HUNDRED, 2, RoundingMode.HALF_UP);
+            return new FeeBreakdown(
+                    explicitSubtotal,
+                    tax,
+                    explicitSubtotal.add(tax).setScale(2, RoundingMode.HALF_UP),
+                    true);
+        }
+        BigDecimal total = legacyTotal == null ? money(reservation.getMontoComision()) : legacyTotal;
+        if (total.compareTo(ZERO) == 0) {
+            return new FeeBreakdown(ZERO, ZERO, ZERO, false);
+        }
+        BigDecimal divisor = ONE_HUNDRED.add(ivaRate).divide(ONE_HUNDRED, 6, RoundingMode.HALF_UP);
+        BigDecimal subtotal = total.divide(divisor, 2, RoundingMode.HALF_UP);
+        BigDecimal tax = total.subtract(subtotal).setScale(2, RoundingMode.HALF_UP);
+        return new FeeBreakdown(subtotal, tax, total.setScale(2, RoundingMode.HALF_UP), false);
+    }
+
+    private BigDecimal addTax(BigDecimal subtotal, BigDecimal ivaRate) {
+        BigDecimal tax = subtotal.multiply(ivaRate).divide(ONE_HUNDRED, 2, RoundingMode.HALF_UP);
+        return subtotal.add(tax).setScale(2, RoundingMode.HALF_UP);
+    }
+
+    private BigDecimal resolveCompatibleMoney(BigDecimal legacyAmount,
+                                              BigDecimal explicitAmount,
+                                              BigDecimal defaultAmount,
+                                              String conflictCode,
+                                              String conflictMessage) {
+        BigDecimal legacy = legacyAmount == null ? null : money(legacyAmount);
+        BigDecimal explicit = explicitAmount == null ? null : money(explicitAmount);
+        if (legacy != null && explicit != null && legacy.compareTo(explicit) != 0) {
+            throw new BusinessException(conflictCode, conflictMessage, HttpStatus.BAD_REQUEST);
+        }
+        if (explicit != null) return explicit;
+        if (legacy != null) return legacy;
+        return money(defaultAmount == null ? ZERO : defaultAmount);
+    }
+
     private void validateReservationReplay(ReservaPagoMasivo existing,
                                            ReservationRequest request,
                                            BigDecimal totalAmount,
@@ -1000,8 +1136,16 @@ public class MassPaymentService {
         payload.put("status", reservation.getEstado().name());
         payload.put("totalBatchAmount", reservation.getMontoTotalLote());
         payload.put("commissionAmount", reservation.getMontoComision());
-        payload.put("chargedCommission", nonNullMoney(reservation.getMontoComisionCobrado()));
+        payload.put("commissionSubtotalQuote", reservation.getMontoComision());
+        payload.put("chargedCommissionSubtotal", nonNullMoney(reservation.getMontoComisionCobrado()));
+        payload.put("chargedCommissionTaxAmount", nonNullMoney(reservation.getMontoComisionIvaCobrado()));
+        payload.put("chargedCommissionTotalAmount", nonNullMoney(reservation.getMontoComisionTotalCobrado()));
+        payload.put("chargedCommission", nonNullMoney(reservation.getMontoComisionTotalCobrado()).signum() > 0
+                ? nonNullMoney(reservation.getMontoComisionTotalCobrado())
+                : nonNullMoney(reservation.getMontoComisionCobrado()));
         payload.put("commissionSettled", Boolean.TRUE.equals(reservation.getComisionLiquidada()));
+        payload.put("feeTransactionUuid", reservation.getUuidTransaccionComision());
+        payload.put("feeJournalEntryUuid", reservation.getAsientoComisionUuid());
         payload.put("reservedAmount", reservation.getMontoReservado());
         payload.put("consumedOnUs", reservation.getMontoConsumidoOnus());
         payload.put("consumedOffUs", reservation.getMontoConsumidoOffus());

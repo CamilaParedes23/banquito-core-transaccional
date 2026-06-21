@@ -67,9 +67,18 @@ public final class AccountMapper {
         );
     }
     public static ReservationResponse toReservation(ReservaPagoMasivo r) {
-        java.math.BigDecimal chargedCommission = r.getMontoComisionCobrado() == null
+        java.math.BigDecimal chargedCommissionSubtotal = r.getMontoComisionCobrado() == null
                 ? java.math.BigDecimal.ZERO.setScale(2)
                 : r.getMontoComisionCobrado();
+        java.math.BigDecimal chargedCommissionTax = r.getMontoComisionIvaCobrado() == null
+                ? java.math.BigDecimal.ZERO.setScale(2)
+                : r.getMontoComisionIvaCobrado();
+        java.math.BigDecimal chargedCommissionTotal = r.getMontoComisionTotalCobrado() == null
+                ? java.math.BigDecimal.ZERO.setScale(2)
+                : r.getMontoComisionTotalCobrado();
+        java.math.BigDecimal legacyChargedCommission = chargedCommissionTotal.signum() > 0
+                ? chargedCommissionTotal
+                : chargedCommissionSubtotal;
         java.math.BigDecimal remaining = r.getMontoReservado()
                 .subtract(r.getMontoConsumidoOnus())
                 .subtract(r.getMontoConsumidoOffus())
@@ -90,13 +99,19 @@ public final class AccountMapper {
                 r.getMontoReservado(),
                 r.getMontoConsumidoOnus(),
                 r.getMontoConsumidoOffus(),
-                chargedCommission,
+                legacyChargedCommission,
                 Boolean.TRUE.equals(r.getComisionLiquidada()),
                 r.getMontoLiberado(),
                 remaining,
                 r.getNumeroCuentaMatriz(),
                 r.getUuidTransaccionFondeo(),
                 r.getAsientoReservaUuid(),
+                r.getMontoComision(),
+                chargedCommissionSubtotal,
+                chargedCommissionTax,
+                chargedCommissionTotal,
+                r.getUuidTransaccionComision(),
+                r.getAsientoComisionUuid(),
                 r.getFechaContable(),
                 r.getFechaCreacion(),
                 r.getFechaActualizacion(),

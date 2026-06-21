@@ -22,6 +22,7 @@ public record ReservationRequest(
         @NotBlank @Size(max = 24) String mainAccountNumber,
         @NotNull @DecimalMin(value = "0.01") @Digits(integer = 17, fraction = 2) BigDecimal totalAmount,
         @DecimalMin(value = "0.00") @Digits(integer = 17, fraction = 2) BigDecimal commissionAmount,
+        @DecimalMin(value = "0.00") @Digits(integer = 17, fraction = 2) BigDecimal commissionSubtotal,
         @Pattern(regexp = "^(SWITCH_WEB|SWITCH_SFTP|SWITCH_API)$", message = "channel no es válido")
         String channel,
         @Pattern(regexp = "^$|^\\d{4}-\\d{2}-\\d{2}$", message = "accountingDate debe usar formato yyyy-MM-dd")
