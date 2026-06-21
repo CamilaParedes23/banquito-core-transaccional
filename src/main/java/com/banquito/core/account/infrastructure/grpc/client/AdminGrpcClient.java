@@ -12,17 +12,19 @@ import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Component;
 
 import java.math.BigDecimal;
+import java.util.concurrent.TimeUnit;
 
 @Component
 public class AdminGrpcClient {
-    private final String host; private final int port; private ManagedChannel channel; private AdminCatalogServiceGrpc.AdminCatalogServiceBlockingStub stub;
+    private final String host; private final int port; private final long timeoutMs; private ManagedChannel channel; private AdminCatalogServiceGrpc.AdminCatalogServiceBlockingStub stub;
     public AdminGrpcClient(@Value("${banquito.integration.admin-grpc-host:core-admin-service}") String host,
-                           @Value("${banquito.integration.admin-grpc-port:9093}") int port) { this.host = host; this.port = port; }
+                           @Value("${banquito.integration.admin-grpc-port:9093}") int port,
+                           @Value("${banquito.integration.grpc-timeout-ms:10000}") long timeoutMs) { this.host = host; this.port = port; this.timeoutMs = timeoutMs; }
     @PostConstruct public void init() { channel = ManagedChannelBuilder.forAddress(host, port).usePlaintext().build(); stub = AdminCatalogServiceGrpc.newBlockingStub(channel); }
     @PreDestroy public void shutdown() { if (channel != null) channel.shutdown(); }
-    public void validateBranchActive(String code) { var r = call(() -> stub.getBranchByCode(BranchCodeRequest.newBuilder().setCode(code).build()), "ADMIN_GRPC_BRANCH_ERROR"); if (!"ACTIVA".equals(r.getStatus())) throw new BusinessException("ADMIN_BRANCH_NOT_ACTIVE", "La sucursal no está activa", HttpStatus.CONFLICT); }
+    public void validateBranchActive(String code) { var r = call(() -> withDeadline().getBranchByCode(BranchCodeRequest.newBuilder().setCode(code).build()), "ADMIN_GRPC_BRANCH_ERROR"); if (!"ACTIVA".equals(r.getStatus())) throw new BusinessException("ADMIN_BRANCH_NOT_ACTIVE", "La sucursal no está activa", HttpStatus.CONFLICT); }
     public AccountSubtypeResponse getActiveAccountSubtype(String code) {
-        var response = call(() -> stub.getAccountSubtype(
+        var response = call(() -> withDeadline().getAccountSubtype(
                 AccountSubtypeCodeRequest.newBuilder().setCode(code).build()),
                 "ADMIN_GRPC_ACCOUNT_SUBTYPE_ERROR");
         if (!"ACTIVO".equals(response.getStatus())) {
@@ -32,7 +34,7 @@ public class AdminGrpcClient {
     }
     public void validateAccountSubtypeActive(String code) { getActiveAccountSubtype(code); }
     public TransactionSubtypeResponse getTransactionSubtype(String code) {
-        return call(() -> stub.getTransactionSubtype(
+        return call(() -> withDeadline().getTransactionSubtype(
                 TransactionSubtypeCodeRequest.newBuilder().setCode(code).build()),
                 "ADMIN_GRPC_TRANSACTION_SUBTYPE_ERROR");
     }
@@ -54,7 +56,7 @@ public class AdminGrpcClient {
         }
     }
     public FinancialInstitutionResponse getActiveInstitution(String routingCode) {
-        var response = call(() -> stub.getInstitutionByRoutingCode(
+        var response = call(() -> withDeadline().getInstitutionByRoutingCode(
                         RoutingCodeRequest.newBuilder().setRoutingCode(routingCode).build()),
                 "ADMIN_GRPC_INSTITUTION_ERROR");
         if (!"ACTIVA".equals(response.getStatus())) {
@@ -78,8 +80,9 @@ public class AdminGrpcClient {
         }
     }
 
-    public BigDecimal getIvaRate() { var r = call(() -> stub.getIvaRate(EmptyRequest.newBuilder().build()), "ADMIN_GRPC_IVA_ERROR"); return new BigDecimal(r.getValue()); }
+    public BigDecimal getIvaRate() { var r = call(() -> withDeadline().getIvaRate(EmptyRequest.newBuilder().build()), "ADMIN_GRPC_IVA_ERROR"); return new BigDecimal(r.getValue()); }
     private <T> T call(GrpcCall<T> call, String code) { try { return call.execute(); } catch (StatusRuntimeException e) { throw translate(code, "Error de catálogo administrativo vía gRPC", e); } }
+    private AdminCatalogServiceGrpc.AdminCatalogServiceBlockingStub withDeadline() { return stub.withDeadlineAfter(timeoutMs, TimeUnit.MILLISECONDS); }
     private BusinessException translate(String code, String fallback, StatusRuntimeException e) { String desc = e.getStatus().getDescription(); if (desc != null && desc.contains("|")) { String[] parts = desc.split("\\|",2); return new BusinessException(parts[0], parts[1], HttpStatus.CONFLICT); } return new BusinessException(code, fallback + ": " + (desc == null ? e.getStatus().getCode() : desc), HttpStatus.CONFLICT); }
     private interface GrpcCall<T> { T execute(); }
 }

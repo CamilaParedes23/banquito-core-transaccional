@@ -9,6 +9,7 @@ service AccountingService {
   rpc GetCurrentAccountingDate(CurrentAccountingDateRequest) returns (AccountingDateReply);
   rpc ResolveOperationAccountingDate(CurrentAccountingDateRequest) returns (AccountingDateReply);
   rpc CreateJournalEntry(CreateJournalEntryRequest) returns (JournalEntryReply);
+  rpc GetJournalEntryByTransactionUuid(JournalEntryByTransactionRequest) returns (JournalEntryLookupReply);
   rpc CreateReversalJournalEntry(CreateReversalJournalEntryRequest) returns (JournalEntryReply);
   rpc GetInstitutionalAccountByFunctionalCode(InstitutionalAccountRequest) returns (InstitutionalAccountReply);
   rpc RunEod(RunEodRequest) returns (EodReply);
@@ -20,6 +21,8 @@ message AccountingDateReply { string accounting_date = 1; string status = 2; }
 message CreateJournalEntryRequest { string correlation_id = 1; string payload_json = 2; }
 message CreateReversalJournalEntryRequest { string original_journal_entry_uuid = 1; string reason = 2; }
 message JournalEntryReply { string journal_entry_uuid = 1; string status = 2; }
+message JournalEntryByTransactionRequest { string transaction_uuid = 1; }
+message JournalEntryLookupReply { bool found = 1; string journal_entry_uuid = 2; string status = 3; }
 message InstitutionalAccountRequest { string functional_code = 1; }
 message InstitutionalAccountReply { string functional_code = 1; string accounting_code = 2; string status = 3; }
 message RunEodRequest { string accounting_date = 1; }

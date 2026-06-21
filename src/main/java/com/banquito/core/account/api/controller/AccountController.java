@@ -76,6 +76,13 @@ public class AccountController {
     public AccountTransactionResponse getTransaction(@PathVariable String transactionUuid) {
         return service.getTransaction(transactionUuid);
     }
+
+    @PostMapping("/accounts/accounting-reconciliation/run")
+    @PreAuthorize("@accountAccessPolicy.canBackoffice(authentication)")
+    public AccountingReconciliationRunResponse runAccountingReconciliation() {
+        return service.runAccountingReconciliation();
+    }
+
     @GetMapping("/accounts/by-customer/{customerUuid}")
     @PreAuthorize("@accountAccessPolicy.canReadCustomer(authentication, #p0)")
     public List<AccountResponse> getAccountsByCustomer(@PathVariable String customerUuid, @RequestParam(required=false) String status, @RequestParam(required=false) Boolean onlyTransferable, @RequestParam(required=false) String purpose, @RequestParam(required=false) Boolean includeBalance) { return service.listByCustomer(customerUuid, status, onlyTransferable, purpose, includeBalance); }

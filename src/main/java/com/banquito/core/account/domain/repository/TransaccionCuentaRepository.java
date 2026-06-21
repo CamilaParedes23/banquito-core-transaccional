@@ -1,6 +1,7 @@
 package com.banquito.core.account.domain.repository;
 
 import com.banquito.core.account.domain.model.*;
+import com.banquito.core.account.domain.enums.EstadoContabilizacionCuentaEnum;
 import jakarta.persistence.LockModeType;
 import org.springframework.data.jpa.repository.EntityGraph;
 import org.springframework.data.jpa.repository.JpaRepository;
@@ -32,5 +33,11 @@ public interface TransaccionCuentaRepository extends JpaRepository<TransaccionCu
 
     @EntityGraph(attributePaths = "cuenta")
     List<TransaccionCuenta> findByCuentaOrderByTimestampTransaccionDesc(Cuenta cuenta);
+
+    @EntityGraph(attributePaths = "cuenta")
+    List<TransaccionCuenta> findTop50ByEstadoContabilizacionInOrderByFechaCreacionAsc(
+            Collection<EstadoContabilizacionCuentaEnum> estados);
+
+    boolean existsByAsientoContableUuid(String asientoContableUuid);
 
 }

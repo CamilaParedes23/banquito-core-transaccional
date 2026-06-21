@@ -21,6 +21,7 @@ import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.TransactionDefinition;
 import org.springframework.transaction.support.TransactionTemplate;
 
 import java.math.BigDecimal;
@@ -82,6 +83,7 @@ public class AccountService {
         this.accountingGrpcClient = accountingGrpcClient;
         this.blockExpirationService = blockExpirationService;
         this.transactionTemplate = new TransactionTemplate(transactionManager);
+        this.transactionTemplate.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
         this.objectMapper = objectMapper;
     }
 
@@ -272,7 +274,7 @@ public class AccountService {
                     correlationId,
                     null,
                     null);
-            openingDeposit.setAsientoContableUuid(registerOpeningDepositJournal(openingDeposit));
+            markAccountingSucceeded(openingDeposit, registerOpeningDepositJournal(openingDeposit));
             transaccionRepository.saveAndFlush(openingDeposit);
             registerOpeningDepositCompletedEvent(openingDeposit, customer.getEmail());
         }
@@ -430,7 +432,7 @@ public class AccountService {
         CustomerBasicGrpcResponse customer = customerGrpcClient.getByUuid(account.getUuidCliente());
         TransaccionCuenta tx = applyMovement(account, TipoMovimientoCuentaEnum.CREDITO, money(r.amount()), subtype,
                 tellerChannel(r.channel()), r.externalReference(), date, r.correlationId(), null, null);
-        tx.setAsientoContableUuid(registerCashJournal(tx, true));
+        markAccountingSucceeded(tx, registerCashJournal(tx, true));
         transaccionRepository.saveAndFlush(tx);
         registerTellerCompletedEvent(tx, "TELLER_DEPOSIT_COMPLETED", "DEPOSITO", customer.getEmail());
         return toTransactionResponse(tx);
@@ -446,7 +448,7 @@ public class AccountService {
         CustomerBasicGrpcResponse customer = customerGrpcClient.getByUuid(account.getUuidCliente());
         TransaccionCuenta tx = applyMovement(account, TipoMovimientoCuentaEnum.DEBITO, money(r.amount()), subtype,
                 tellerChannel(r.channel()), r.externalReference(), date, r.correlationId(), null, null);
-        tx.setAsientoContableUuid(registerCashJournal(tx, false));
+        markAccountingSucceeded(tx, registerCashJournal(tx, false));
         transaccionRepository.saveAndFlush(tx);
         registerTellerCompletedEvent(tx, "TELLER_WITHDRAWAL_COMPLETED", "RETIRO", customer.getEmail());
         return toTransactionResponse(tx);
@@ -493,8 +495,8 @@ public class AccountService {
         TransaccionCuenta debit = applyMovement(source, TipoMovimientoCuentaEnum.DEBITO, money(r.amount()), "TRF_P2P_DEB", CanalOrigenCuentaEnum.BANCA_WEB, description, date, corr, null, null);
         TransaccionCuenta credit = applyMovement(target, TipoMovimientoCuentaEnum.CREDITO, money(r.amount()), "TRF_P2P_CRE", CanalOrigenCuentaEnum.BANCA_WEB, description, date, corr, null, null);
         String asientoContableUuid = registerP2PJournal(debit, credit);
-        debit.setAsientoContableUuid(asientoContableUuid);
-        credit.setAsientoContableUuid(asientoContableUuid);
+        markAccountingSucceeded(debit, asientoContableUuid);
+        markAccountingSucceeded(credit, asientoContableUuid);
         transaccionRepository.saveAllAndFlush(List.of(debit, credit));
 
         Map<String, Object> eventPayload = new LinkedHashMap<>();
@@ -653,7 +655,7 @@ public class AccountService {
                 reversal,
                 reverseSubtype,
                 "Reverso de transacción " + txUuid + ": " + request.reason());
-        reversal.setAsientoContableUuid(journalEntryUuid);
+        markAccountingSucceeded(reversal, journalEntryUuid);
         original.setEstado(EstadoTransaccionCuentaEnum.REVERSADA);
         transaccionRepository.saveAllAndFlush(List.of(original, reversal));
 
@@ -728,8 +730,16 @@ public class AccountService {
         }
 
         if (result.accountingPayload() != null && result.transactionUuid() != null && result.movementUuid() != null) {
-            String asientoContableUuid = accountingGrpcClient.createJournalEntry(result.accountingPayload());
-            transactionTemplate.executeWithoutResult(status -> updateAccountingReference(result.transactionUuid(), result.movementUuid(), asientoContableUuid));
+            try {
+                String asientoContableUuid = accountingGrpcClient.createJournalEntry(result.accountingPayload());
+                transactionTemplate.executeWithoutResult(status -> updateAccountingReference(result.transactionUuid(), result.movementUuid(), asientoContableUuid));
+            } catch (BusinessException exception) {
+                markAccountingRequiresReconciliation(result.transactionUuid(), exception.getCode(), exception.getMessage());
+                throw exception;
+            } catch (RuntimeException exception) {
+                markAccountingRequiresReconciliation(result.transactionUuid(), "ACCOUNTING_RECONCILIATION_REQUIRED", exception.getMessage());
+                throw exception;
+            }
         }
 
         return result.response();
@@ -826,6 +836,10 @@ public class AccountService {
         MovimientoReservaPago movimiento = movimientoReservaRepository.findByUuidMovimiento(movementUuid)
                 .orElseThrow(() -> notFound("ACCOUNT_RESERVATION_MOVEMENT_NOT_FOUND", "Movimiento de reserva no encontrado para actualizar referencia contable"));
         tx.setAsientoContableUuid(asientoContableUuid);
+            tx.setEstadoContabilizacion(EstadoContabilizacionCuentaEnum.CONTABILIZADA);
+            tx.setFechaContabilizacion(LocalDateTime.now());
+            tx.setCodigoErrorContable(null);
+            tx.setMensajeErrorContable(null);
         movimiento.setAsientoContableUuid(asientoContableUuid);
         transaccionRepository.saveAndFlush(tx);
         movimientoReservaRepository.saveAndFlush(movimiento);
@@ -930,6 +944,7 @@ public class AccountService {
         t.setSaldoContableResultante(c.getSaldoContable());
         t.setSaldoDisponibleResultante(c.getSaldoDisponible());
         t.setEstado(EstadoTransaccionCuentaEnum.APLICADA);
+        t.setEstadoContabilizacion(EstadoContabilizacionCuentaEnum.PENDIENTE_CONTABILIDAD);
         t.setCanalOrigen(channel);
         t.setReferenciaExterna(externalRef);
         t.setNumeroComprobante("CMP-" + System.currentTimeMillis());
@@ -946,6 +961,34 @@ public class AccountService {
                 line(null, "CLIENTES_PASIVO", "CREDITO", tx.getMonto(), "Abono inicial a cuenta cliente", 2));
         return accountingGrpcClient.createJournalEntry(
                 journal(tx, "DEPOSITO_APERTURA_CUENTA", OPENING_DEPOSIT_DESCRIPTION, lines));
+    }
+
+    private void markAccountingSucceeded(TransaccionCuenta tx, String asientoContableUuid) {
+        tx.setAsientoContableUuid(asientoContableUuid);
+        tx.setEstadoContabilizacion(EstadoContabilizacionCuentaEnum.CONTABILIZADA);
+        tx.setFechaContabilizacion(LocalDateTime.now());
+        tx.setCodigoErrorContable(null);
+        tx.setMensajeErrorContable(null);
+    }
+
+    private void markAccountingRequiresReconciliation(String transactionUuid, String code, String message) {
+        if (transactionUuid == null || transactionUuid.isBlank()) {
+            return;
+        }
+        transactionTemplate.executeWithoutResult(status -> {
+            transaccionRepository.findByUuidTransaccionForUpdate(transactionUuid).ifPresent(tx -> {
+                tx.setEstadoContabilizacion(EstadoContabilizacionCuentaEnum.REQUIERE_RECONCILIACION);
+                tx.setCodigoErrorContable(code);
+                tx.setMensajeErrorContable(message == null ? null : message.substring(0, Math.min(message.length(), 500)));
+                transaccionRepository.saveAndFlush(tx);
+                auditoriaService.registrar(
+                        "ACCOUNTING_RECONCILIATION_REQUIRED",
+                        "TRANSACCION_CUENTA",
+                        tx.getUuidTransaccion(),
+                        ResultadoAuditoriaAccountEnum.ERROR,
+                        toJson(Map.of("code", code == null ? "UNKNOWN" : code, "message", message == null ? "" : message)));
+            });
+        });
     }
 
     private void registerOpeningDepositCompletedEvent(TransaccionCuenta tx, String customerEmail) {
@@ -1326,6 +1369,46 @@ public class AccountService {
     private BigDecimal nonNegative(BigDecimal value) {
         if (value == null || value.compareTo(ZERO) < 0) return ZERO.setScale(2, RoundingMode.HALF_UP);
         return value.setScale(2, RoundingMode.HALF_UP);
+    }
+
+    @Transactional
+    public AccountingReconciliationRunResponse runAccountingReconciliation() {
+        List<TransaccionCuenta> candidates = transaccionRepository
+                .findTop50ByEstadoContabilizacionInOrderByFechaCreacionAsc(List.of(
+                        EstadoContabilizacionCuentaEnum.PENDIENTE_CONTABILIDAD,
+                        EstadoContabilizacionCuentaEnum.REQUIERE_RECONCILIACION));
+        int reconciled = 0;
+        int stillPending = 0;
+        int manualReview = 0;
+        for (TransaccionCuenta tx : candidates) {
+            try {
+                Optional<String> journalUuid = accountingGrpcClient.findJournalEntryByTransactionUuid(tx.getUuidTransaccion());
+                if (journalUuid.isPresent()) {
+                    markAccountingSucceeded(tx, journalUuid.get());
+                    transaccionRepository.saveAndFlush(tx);
+                    auditoriaService.registrar(
+                            "ACCOUNTING_RECONCILIATION_MATCHED",
+                            "TRANSACCION_CUENTA",
+                            tx.getUuidTransaccion(),
+                            ResultadoAuditoriaAccountEnum.OK,
+                            toJson(Map.of("journalEntryUuid", journalUuid.get())));
+                    reconciled++;
+                } else {
+                    tx.setEstadoContabilizacion(EstadoContabilizacionCuentaEnum.REQUIERE_RECONCILIACION);
+                    tx.setCodigoErrorContable("ACCOUNTING_JOURNAL_NOT_FOUND");
+                    tx.setMensajeErrorContable("No existe asiento contable para la transacción; requiere revisión o compensación controlada");
+                    transaccionRepository.saveAndFlush(tx);
+                    manualReview++;
+                }
+            } catch (BusinessException exception) {
+                tx.setEstadoContabilizacion(EstadoContabilizacionCuentaEnum.REQUIERE_RECONCILIACION);
+                tx.setCodigoErrorContable(exception.getCode());
+                tx.setMensajeErrorContable(exception.getMessage());
+                transaccionRepository.saveAndFlush(tx);
+                stillPending++;
+            }
+        }
+        return new AccountingReconciliationRunResponse(candidates.size(), reconciled, stillPending, manualReview);
     }
 
     private String normalizeActor(String actorUuid) {

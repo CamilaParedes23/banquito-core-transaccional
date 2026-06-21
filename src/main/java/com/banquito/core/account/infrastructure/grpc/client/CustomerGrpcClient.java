@@ -11,19 +11,24 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Component;
 
+import java.util.concurrent.TimeUnit;
+
 @Component
 public class CustomerGrpcClient {
     private static final String ACTIVE_STATUS = "ACTIVO";
 
     private final String host;
     private final int port;
+    private final long timeoutMs;
     private ManagedChannel channel;
     private CustomerQueryServiceGrpc.CustomerQueryServiceBlockingStub stub;
 
     public CustomerGrpcClient(@Value("${banquito.integration.customer-grpc-host:core-customer-service}") String host,
-                              @Value("${banquito.integration.customer-grpc-port:9092}") int port) {
+                              @Value("${banquito.integration.customer-grpc-port:9092}") int port,
+                              @Value("${banquito.integration.grpc-timeout-ms:10000}") long timeoutMs) {
         this.host = host;
         this.port = port;
+        this.timeoutMs = timeoutMs;
     }
 
     @PostConstruct
@@ -42,7 +47,7 @@ public class CustomerGrpcClient {
     public CustomerBasicGrpcResponse getByUuid(String uuid) {
         String normalizedUuid = normalizeUuid(uuid);
         try {
-            return stub.getCustomerByUuid(GetCustomerByUuidRequest.newBuilder()
+            return withDeadline().getCustomerByUuid(GetCustomerByUuidRequest.newBuilder()
                     .setCustomerUuid(normalizedUuid)
                     .build());
         } catch (StatusRuntimeException e) {
@@ -53,7 +58,7 @@ public class CustomerGrpcClient {
     public void validateActive(String uuid) {
         String normalizedUuid = normalizeUuid(uuid);
         try {
-            var r = stub.validateCustomerStatus(ValidateCustomerStatusRequest.newBuilder()
+            var r = withDeadline().validateCustomerStatus(ValidateCustomerStatusRequest.newBuilder()
                     .setCustomerUuid(normalizedUuid)
                     .build());
             if (!r.getValid()) {
@@ -80,7 +85,7 @@ public class CustomerGrpcClient {
     public void validateMassPaymentsEnabled(String uuid) {
         String normalizedUuid = normalizeUuid(uuid);
         try {
-            var r = stub.validateMassPaymentsEnabled(ValidateMassPaymentsEnabledRequest.newBuilder()
+            var r = withDeadline().validateMassPaymentsEnabled(ValidateMassPaymentsEnabledRequest.newBuilder()
                     .setCustomerUuid(normalizedUuid)
                     .build());
             if (!r.getValid()) {
@@ -89,6 +94,10 @@ public class CustomerGrpcClient {
         } catch (StatusRuntimeException e) {
             throw translate("CUSTOMER_GRPC_MASS_PAYMENTS_ERROR", "No fue posible validar pagos masivos por gRPC", e);
         }
+    }
+
+    private CustomerQueryServiceGrpc.CustomerQueryServiceBlockingStub withDeadline() {
+        return stub.withDeadlineAfter(timeoutMs, TimeUnit.MILLISECONDS);
     }
 
     private static String normalizeUuid(String uuid) {

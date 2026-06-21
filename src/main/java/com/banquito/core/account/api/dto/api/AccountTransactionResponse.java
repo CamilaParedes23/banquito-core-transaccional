@@ -21,5 +21,9 @@ public record AccountTransactionResponse(
         String receiptNumber,
         String documentReceiptUuid,
         String correlationId,
-        String reversedTransactionUuid
+        String reversedTransactionUuid,
+        String accountingStatus,
+        String accountingJournalEntryUuid,
+        String accountingFailureCode,
+        String accountingFailureMessage
 ) {}

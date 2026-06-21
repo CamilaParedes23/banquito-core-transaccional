@@ -59,7 +59,11 @@ public final class AccountMapper {
                 t.getNumeroComprobante(),
                 t.getUuidDocumentoComprobante(),
                 t.getUuidCorrelacion(),
-                t.getTransaccionReversada() == null ? null : t.getTransaccionReversada().getUuidTransaccion()
+                t.getTransaccionReversada() == null ? null : t.getTransaccionReversada().getUuidTransaccion(),
+                t.getEstadoContabilizacion() == null ? null : t.getEstadoContabilizacion().name(),
+                t.getAsientoContableUuid(),
+                t.getCodigoErrorContable(),
+                t.getMensajeErrorContable()
         );
     }
     public static ReservationResponse toReservation(ReservaPagoMasivo r) {

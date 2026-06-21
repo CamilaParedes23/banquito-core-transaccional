@@ -8,6 +8,7 @@ import com.banquito.core.account.api.dto.api.ReservationResponse;
 import com.banquito.core.account.api.dto.internal.MassPaymentOperationResult;
 import com.banquito.core.account.domain.enums.CanalOrigenCuentaEnum;
 import com.banquito.core.account.domain.enums.CanalOrigenReservaEnum;
+import com.banquito.core.account.domain.enums.EstadoContabilizacionCuentaEnum;
 import com.banquito.core.account.domain.enums.EstadoCuentaEnum;
 import com.banquito.core.account.domain.enums.EstadoInstruccionPagoMasivoEnum;
 import com.banquito.core.account.domain.enums.EstadoMovimientoReservaEnum;
@@ -179,7 +180,7 @@ public class MassPaymentService {
                         line("CLIENTES_PASIVO", "DEBITO", reservedAmount, "Débito global cuenta matriz", 1),
                         line("FONDOS_RESERVADOS_PM", "CREDITO", reservedAmount, "Fondeo de reserva del lote", 2))));
 
-        fundingTransaction.setAsientoContableUuid(journalUuid);
+        markAccountingSucceeded(fundingTransaction, journalUuid);
         transaccionRepository.saveAndFlush(fundingTransaction);
         reservation.setUuidTransaccionFondeo(fundingTransaction.getUuidTransaccion());
         reservation.setAsientoReservaUuid(journalUuid);
@@ -339,7 +340,7 @@ public class MassPaymentService {
                         line("FONDOS_RESERVADOS_PM", "DEBITO", amount, "Consumo de fondos reservados", 1),
                         line("CLIENTES_PASIVO", "CREDITO", amount, "Crédito al beneficiario BanQuito", 2))));
 
-        beneficiaryTransaction.setAsientoContableUuid(journalUuid);
+        markAccountingSucceeded(beneficiaryTransaction, journalUuid);
         transaccionRepository.saveAndFlush(beneficiaryTransaction);
         instruction.setUuidTransaccionCore(beneficiaryTransaction.getUuidTransaccion());
         instruction.setAsientoContableUuid(journalUuid);
@@ -449,7 +450,7 @@ public class MassPaymentService {
                             line("CLIENTES_PASIVO", "DEBITO", amount, "Débito de comisión a cuenta matriz", 1),
                             line("INGRESOS_SERVICIOS_MASIVOS", "CREDITO", netAmount, "Ingreso neto por servicio", 2),
                             line("IVA_RETENIDO", "CREDITO", ivaAmount, "IVA retenido", 3))));
-            feeTransaction.setAsientoContableUuid(journalUuid);
+            markAccountingSucceeded(feeTransaction, journalUuid);
             transaccionRepository.saveAndFlush(feeTransaction);
         }
 
@@ -537,7 +538,7 @@ public class MassPaymentService {
                 List.of(
                         line("FONDOS_RESERVADOS_PM", "DEBITO", remaining, "Disminución de fondos reservados", 1),
                         line("CLIENTES_PASIVO", "CREDITO", remaining, "Reintegro a cuenta matriz", 2))));
-        releaseTransaction.setAsientoContableUuid(journalUuid);
+        markAccountingSucceeded(releaseTransaction, journalUuid);
         transaccionRepository.saveAndFlush(releaseTransaction);
 
         reservation.setMontoLiberado(reservation.getMontoLiberado().add(remaining));
@@ -639,7 +640,7 @@ public class MassPaymentService {
                 List.of(
                         line("FONDOS_RESERVADOS_PM", "DEBITO", reservation.getMontoReservado(), "Reverso de fondos reservados", 1),
                         line("CLIENTES_PASIVO", "CREDITO", reservation.getMontoReservado(), "Reintegro total a cuenta matriz", 2))));
-        reversalTransaction.setAsientoContableUuid(journalUuid);
+        markAccountingSucceeded(reversalTransaction, journalUuid);
         transaccionRepository.saveAndFlush(reversalTransaction);
 
         reservation.setEstado(EstadoReservaPagoMasivoEnum.REVERSADA);
@@ -730,11 +731,20 @@ public class MassPaymentService {
         transaction.setSaldoContableResultante(account.getSaldoContable());
         transaction.setSaldoDisponibleResultante(account.getSaldoDisponible());
         transaction.setEstado(EstadoTransaccionCuentaEnum.APLICADA);
+        transaction.setEstadoContabilizacion(EstadoContabilizacionCuentaEnum.PENDIENTE_CONTABILIDAD);
         transaction.setCanalOrigen(CanalOrigenCuentaEnum.SWITCH);
         transaction.setReferenciaExterna(blankToNull(externalReference));
         transaction.setNumeroComprobante("CMP-" + System.currentTimeMillis());
         transaction.setFechaCreacion(LocalDateTime.now());
         return transaccionRepository.saveAndFlush(transaction);
+    }
+
+    private void markAccountingSucceeded(TransaccionCuenta transaction, String journalUuid) {
+        transaction.setAsientoContableUuid(journalUuid);
+        transaction.setEstadoContabilizacion(EstadoContabilizacionCuentaEnum.CONTABILIZADA);
+        transaction.setFechaContabilizacion(LocalDateTime.now());
+        transaction.setCodigoErrorContable(null);
+        transaction.setMensajeErrorContable(null);
     }
 
     private MovimientoReservaPago registerReservationMovement(ReservaPagoMasivo reservation,

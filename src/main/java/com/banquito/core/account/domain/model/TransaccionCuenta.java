@@ -31,6 +31,15 @@ public class TransaccionCuenta {
     private String codigoSubtipoTransaccion;
     @Column(name = "ASIENTO_CONTABLE_UUID", length = 36)
     private String asientoContableUuid;
+    @Enumerated(EnumType.STRING)
+    @Column(name = "ESTADO_CONTABILIZACION", length = 40, nullable = false)
+    private EstadoContabilizacionCuentaEnum estadoContabilizacion;
+    @Column(name = "FECHA_CONTABILIZACION")
+    private LocalDateTime fechaContabilizacion;
+    @Column(name = "CODIGO_ERROR_CONTABLE", length = 80)
+    private String codigoErrorContable;
+    @Column(name = "MENSAJE_ERROR_CONTABLE", length = 500)
+    private String mensajeErrorContable;
     @ManyToOne(fetch = FetchType.LAZY)
     @JoinColumn(name = "RESERVA_PAGO_MASIVO_ID")
     private ReservaPagoMasivo reservaPagoMasivo;
