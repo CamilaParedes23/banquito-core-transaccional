@@ -173,8 +173,11 @@ public class OutboxIntegrationDispatcher {
                 Map.of(
                         "nombre", string(payload, "beneficiaryName"),
                         "monto", amount(payload),
+                        "cuentaDestino", string(payload, "destinationAccountNumber"),
                         "concepto", string(payload, "concept"),
                         "empresa", string(payload, "companyName"),
+                        "empresaEmisora", string(payload, "companyName"),
+                        "fechaEnvio", string(payload, "accountingDate"),
                         "comprobante", string(payload, "receiptNumber")
                 )
         ));
@@ -206,7 +209,7 @@ public class OutboxIntegrationDispatcher {
                 "CLIENTE",
                 nullableString(payload, "customerEmail"),
                 string(payload, "holderName"),
-                null,
+                "ACCOUNT_OPENING_FUNDED_EMAIL",
                 documentUuid,
                 Map.of(
                         "nombre", string(payload, "holderName"),
@@ -215,10 +218,6 @@ public class OutboxIntegrationDispatcher {
                         "comprobante", string(payload, "receiptNumber")
                 )
         );
-        request.put("subject", "Cuenta abierta con depósito inicial");
-        request.put("body", "Se abrió la cuenta " + string(payload, "accountNumber")
-                + " con un depósito inicial de " + amount(payload)
-                + ". Comprobante: " + string(payload, "receiptNumber"));
         notificationClient.request(request);
     }
 
@@ -248,7 +247,9 @@ public class OutboxIntegrationDispatcher {
                 "CLIENTE",
                 nullableString(payload, "customerEmail"),
                 string(payload, "holderName"),
-                null,
+                "DEPOSITO".equalsIgnoreCase(operationName)
+                        ? "TELLER_DEPOSIT_COMPLETED_EMAIL"
+                        : "TELLER_WITHDRAWAL_COMPLETED_EMAIL",
                 documentUuid,
                 Map.of(
                         "nombre", string(payload, "holderName"),
@@ -258,10 +259,6 @@ public class OutboxIntegrationDispatcher {
                         "comprobante", string(payload, "receiptNumber")
                 )
         );
-        request.put("subject", "Comprobante de " + operationName.toLowerCase() + " en ventanilla");
-        request.put("body", "Se registró un " + operationName.toLowerCase()
-                + " por " + amount(payload) + " en la cuenta " + string(payload, "accountNumber")
-                + ". Comprobante: " + string(payload, "receiptNumber"));
         notificationClient.request(request);
     }
 
